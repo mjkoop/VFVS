@@ -1,4 +1,7 @@
+#!/usr/bin/env bash
+
 # Copyright (C) 2019 Christoph Gorgulla
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # This file is part of VirtualFlow.
 #
@@ -15,7 +18,24 @@
 # You should have received a copy of the GNU General Public License
 # along with VirtualFlow.  If not, see <https://www.gnu.org/licenses/>.
 
-echo "        ::  ::  ::  ::::. :::::: ::  ::  .::::.  ::      :::::  ::    .::::. ::      ::"
-echo "        ::  ::  ::  :: ::   ::   ::  ::  ::  ::  ::      ::     ::    ::  :: ::  ::  ::"
-echo "         ::::   ::  :::.    ::   ::  ::  ::::::  ::      :::::  ::    ::  ::  ::::::::"
-echo "          ::    ::  :: ::   ::    ::::   ::  ::  ::::    ::     ::::: '::::'   ::  ::"
+# ---------------------------------------------------------------------------
+#
+# Description: AWS Batch job file.
+#
+# Revision history:
+# 2020-06-27  Original version
+#
+# ---------------------------------------------------------------------------
+
+
+# Job Information
+##################################################################################
+
+df -h
+cat /var/lib/cloud/data/instance-id
+
+export VFVS_WORKUNIT_SUBJOB=${AWS_BATCH_JOB_ARRAY_INDEX}
+
+cd /opt/vf/tools/templates/
+./vfvs_run.py
+
