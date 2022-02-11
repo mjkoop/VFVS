@@ -108,8 +108,8 @@ This output format can be automatically generated from newer versions of VFLP. (
 Login to the main node and execute the following to obtain the latest version of the code.
 
 ```bash
-git clone https://github.com/VirtualFlow/VFLP-AWS.git
-cd VFLP-AWS
+git clone -b aws_combined https://github.com/mjkoop/VFVS.git
+cd VFVS
 ```
 
 #### Update the configuration file
