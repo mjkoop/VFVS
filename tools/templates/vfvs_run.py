@@ -62,13 +62,29 @@ def process_config(ctx):
     ctx['main_config']['docking_scenarios'] = {}
 
     for index, scenario in enumerate(ctx['main_config']['docking_scenario_names']):
+
+        program_long = ctx['main_config']['docking_scenario_programs'][index]
+        program = program_long
+
+        logging.debug(f"Processing scenario '{scenario}' at index '{index}' with {program}")
+
+        # Special handing for smina* and gwovina*
+        match = re.search(r'^(?P<program>smina|gwovina)', program_long)
+        if(match):
+            matches = match.groupdict()
+            program = matches['program']
+            logging.debug(f"Found {program} in place of {program_long}")
+        else:
+            logging.debug(f"No special match for '{program_long}'")
+
         ctx['main_config']['docking_scenarios'][scenario] = {
             'key': scenario,
             'config': os.path.join(ctx['temp_dir'], "vf_input", "input-files",
                                    ctx['main_config']['docking_scenario_inputfolders'][index],
                                    "config.txt"
                                    ),
-            'program': ctx['main_config']['docking_scenario_programs'][index],
+            'program': program,
+            'program_long': program_long,
             'replicas': int(ctx['main_config']['docking_scenario_replicas'][index])
         }
 
@@ -125,7 +141,7 @@ def program_runstring_array(task):
     cpus_per_program = "1"
 
     cmd = []
-   
+
     if(task['program'] == "qvina02"
             or task['program'] == "qvina_w"
             or task['program'] == "vina"
@@ -141,37 +157,37 @@ def program_runstring_array(task):
             '--out', task['output_path']
         ]
     elif(task['program'] == "smina"):
-        # TODO: setup the appropriate paths
         cmd = [
             '/opt/vf/tools/bin/smina',
             '--cpu', cpus_per_program,
             '--config', task['config_path'],
             '--ligand', task['ligand_path'],
             '--out', task['output_path'],
-            '--log',
-            '--atom_terms'
-            # .atomterms
-            # .flexres.pdb
+            '--log', f"task['output_path_base'].flexres.pdb",
+            '--atom_terms', f"task['output_path_base'].atomterms"
         ]
-    elif(task['program'] == "adfr"):
-        # TODO: convert config.txt and remove all newlines and pass in
+    else:
+        raise RuntimeError(f"Invalid program type of {task['program']}")
 
-        adfr_config_options = ""
-
-        cmd = [
-            'adfr',
-            '-l', task['ligand_path'],
-            '--jobName', 'adfr',
-            adfr_config_options
-        ]
+    #elif(task['program'] == "adfr"):
+    #    # TODO: convert config.txt and remove all newlines and pass in
+    #
+    #    adfr_config_options = ""
+    #
+    #    cmd = [
+    #        'adfr',
+    #        '-l', task['ligand_path'],
+    #        '--jobName', 'adfr',
+    #        adfr_config_options
+    #    ]
         #                     adfr_configfile_options=$(cat ${docking_scenario_inputfolder}/config.txt | tr -d "\n")
     #            { bin/time_bin -f " Docking timings \n-------------------------------------- \n user real system \n %U %e %S \n------------------------------------- \n" adfr -l ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/input-files/ligands/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}.${ligand_library_format} --jobName adfr ${adfr_configfile_options} 2> >(tee ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output.tmp 1>&2) ; } 2>&1
     #            rename "_adfr_adfr.out" "" ${next_ligand}_replica-${docking_replica_index} ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output-files/incomplete/${docking_scenario_name}/logfiles/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}*
     #
     #            score_value=$(grep -m 1 "FEB" ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output-files/incomplete/${docking_scenario_name}/logfiles/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}_replica-${docking_replica_index}.${ligand_library_format} | awk -F ': ' '{print $(NF)}')
-    elif(task['program'] == "plants"):
-        # TODO implement plants
-        adfr_config_options = ""
+    #elif(task['program'] == "plants"):
+    #    # TODO implement plants
+    #    adfr_config_options = ""
 
     return cmd
 
@@ -193,7 +209,11 @@ def process_ligand(task):
         'status': "failed(docking)"
     }
 
-    cmd = program_runstring_array(task)
+    try:
+        cmd = program_runstring_array(task)
+    except RuntimeError as err:
+        logging.error(f"Invalid cmd generation for {task['ligand_key']} (program: '{task['program']}')")
+        raise(err)
 
     try:
         ret = subprocess.run(cmd, capture_output=True,
@@ -224,8 +244,19 @@ def process_ligand(task):
                     f"Could not find score for {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
 
         elif(task['program'] == "smina"):
+            found = 0
             for line in reversed(ret.stdout.splitlines()):
-                match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s+', line)
+                match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
+                if(match):
+                    matches = match.groupdict()
+                    completion_event['score'] = float(matches['value'])
+                    completion_event['status'] = "success"
+                    found = 1
+                    break
+            if(found == 0):
+                logging.error(
+                    f"Could not find score for {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
+
         elif(task['program'] == "adfr"):
             logging.error(
                 f"adfr not implemented {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
@@ -395,6 +426,7 @@ def scenario_collection_output(ctx, scenario, collection, result_type, skip_num=
                 hash_string[2:4],
                 ctx['main_config']['job_letter'],
                 "output",
+                scenario['key'],
                 result_type,
                 collection['collection_name'],
                 get_formatted_collection_number(collection['collection_number'])
@@ -410,6 +442,7 @@ def scenario_collection_output(ctx, scenario, collection, result_type, skip_num=
                 hash_string[2:4],
                 ctx['main_config']['job_letter'],
                 "output",
+                scenario['key'],
                 result_type,
                 collection['collection_name']
             ]
@@ -429,6 +462,7 @@ def scenario_collection_output(ctx, scenario, collection, result_type, skip_num=
 
         if(append != ""):
             path_components[-1] = f"{path_components[-1]}{append}"
+
 
     return path_components
 
@@ -661,6 +695,8 @@ def process(ctx):
     for scenario_key in ctx['main_config']['docking_scenarios']:
         scenario = ctx['main_config']['docking_scenarios'][scenario_key]
 
+        logging.debug(f"Generating scenario information for '{scenario_key}', program '{scenario['program']}'")
+
         # For each collection
         for collection_key in collections:
             collection = collections[collection_key]
@@ -689,12 +725,15 @@ def process(ctx):
                     task = {
                         'collection_key': collection_key,
                         'ligand_key': ligand_key,
+                        'ligand_format': ligand_format,
                         'scenario_key': scenario_key,
                         'config_path': scenario['config'],
                         'program': scenario['program'],
+                        'program_long': scenario['program_long'],
                         'replica_index': replica_index,
                         'ligand_path': ligand['path'],
-                        'output_path': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}'),
+                        'output_path_base': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}'),
+                        'output_path': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}.{ligand_format}'),
                         'log_path': os.path.join(log_dir, f'{ligand_key}_replica-{replica_index}'),
                         'input_files_dir':  os.path.join(ctx['temp_dir'], "vf_input", "input-files"),
                         'timeout': int(ctx['main_config']['program_timeout'])
@@ -754,6 +793,7 @@ def process(ctx):
     # Generate the compressed files
 
     for scenario_key in ctx['main_config']['docking_scenarios']:
+        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
         for collection_key in collections:
             collection = collections[collection_key]
 
@@ -770,9 +810,9 @@ def process(ctx):
     # Now we need to move these data files -- S3 or elsewhere on the filesystem
 
     for scenario_key in ctx['main_config']['docking_scenarios']:
+        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
         for collection_key in collections:
             collection = collections[collection_key]
-
 
             logging.info(f"Completed scenario: {scenario_key}, collection: {collection_key}")
 
