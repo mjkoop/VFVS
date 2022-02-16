@@ -220,8 +220,9 @@ def process_ligand(task):
                          text=True, cwd=task['input_files_dir'], timeout=task['timeout'])
     except subprocess.TimeoutExpired as err:
         logging.error(f"timeout on {task['ligand_key']}")
+        end_time = time.perf_counter()
+        completion_event['seconds'] = end_time - start_time
         return completion_event
-        #raise RuntimeError(f"{cmd} timed out") from err
 
     if ret.returncode == 0:
 
