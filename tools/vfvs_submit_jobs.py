@@ -136,7 +136,6 @@ def submit_aws_batch(config, client, current_workunit, jobline):
 
         current_workunit['status'] = {
             'vf_job_status': 'SUBMITTED',
-            'job_arn': response['jobArn'],
             'job_name': response['jobName'],
             'job_id': response['jobId']
         }
