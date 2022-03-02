@@ -7,6 +7,9 @@ job_letter=testing
 batchsystem=awsbatch
 # Possible values: awsbatch
 
+threads_per_docking=1
+# How many threads should be used for each docking program. 
+
 threads_to_use=8
 # This sets how many processes the main execution loop should be using
 # to process. This is generally 2x the number of vCPUs or hyperthreads
@@ -55,6 +58,17 @@ aws_ecr_repository_name=vf-vfvs-ecr
 aws_region=us-east-1
 # Set to the AWS location code where you are running AWS Batch
 # (e.g. us-east-1 for North America, Northern Virginia)
+
+aws_batch_subjob_vcpus=8
+# Set to the number of vCPUs that should be launched per subjob. 
+# 'threads_to_use' above should be >= to this value. 
+
+aws_batch_subjob_memory=15000
+# Memory per subjob to setup for the container in MB
+
+aws_batch_subjob_timeout=10800
+# Maximum amount of time (in seconds) that a single AWS Batch job should 
+# ever run before being terminated.
 
 
 ****** Object Store Settings
