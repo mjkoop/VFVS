@@ -80,6 +80,10 @@ def check_parameters(config):
         print("* 'threads_to_use' must be set in all.ctrl")
         error = 1
 
+    if(empty_value(config, 'threads_per_docking')):
+        print("* 'threads_per_docking' must be set in all.ctrl")
+        error = 1
+
     if(empty_value(config, 'object_store_data_collection_addressing_mode')):
         print("* 'object_store_data_collection_addressing_mode' must be set in all.ctrl")
         error = 1
@@ -134,9 +138,17 @@ def check_parameters(config):
                 print("* 'aws_ecr_repository_name' must be set if batchsystem is 'awsbatch'")
                 error = 1
             if(empty_value(config, 'aws_region')):
-                print("* 'aws_ecr_repository_name' must be set if batchsystem is 'awsbatch'")
+                print("* 'aws_region' must be set if batchsystem is 'awsbatch'")
                 error = 1
-
+            if(empty_value(config, 'aws_batch_subjob_vcpus')):
+                print("* 'aws_batch_subjob_vcpus' must be set if batchsystem is 'awsbatch'")
+                error = 1
+            if(empty_value(config, 'aws_batch_subjob_memory')):
+                print("* 'aws_batch_subjob_vcpus' must be set if batchsystem is 'awsbatch'")
+                error = 1
+            if(empty_value(config, 'aws_batch_subjob_timeout')):
+                print("* 'aws_batch_subjob_timeout' must be set if batchsystem is 'awsbatch'")
+                error = 1
             if(empty_value(config, 'tempdir_default') or config['tempdir_default'] != "/dev/shm"):
                 print("* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used")
                 error = 1

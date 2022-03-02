@@ -138,7 +138,7 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
 
 def program_runstring_array(task):
 
-    cpus_per_program = "1"
+    cpus_per_program = str(task['threads_per_docking'])
 
     cmd = []
 
@@ -737,7 +737,8 @@ def process(ctx):
                         'output_path': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}.{ligand_format}'),
                         'log_path': os.path.join(log_dir, f'{ligand_key}_replica-{replica_index}'),
                         'input_files_dir':  os.path.join(ctx['temp_dir'], "vf_input", "input-files"),
-                        'timeout': int(ctx['main_config']['program_timeout'])
+                        'timeout': int(ctx['main_config']['program_timeout']),
+                        'threads_per_docking': int(ctx['main_config']['threads_per_docking'])
                     }
 
                     tasklist.append(task)

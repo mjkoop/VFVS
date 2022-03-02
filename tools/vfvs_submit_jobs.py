@@ -77,7 +77,7 @@ def submit_aws_batch(config, client, current_workunit, jobline):
         response = client.submit_job(
             jobName=f'vfvs-{config["job_letter"]}-{jobline}',
             timeout={
-                'attemptDurationSeconds': 10800
+                'attemptDurationSeconds': int(config["aws_batch_subjob_timeout"])
             },
             jobQueue=f"{config['aws_batch_prefix']}-queue{batch_queue_number}",
             arrayProperties={
@@ -88,11 +88,11 @@ def submit_aws_batch(config, client, current_workunit, jobline):
                 'resourceRequirements': [
                     {
                         'type': 'VCPU',
-                        'value': '8',
+                        'value': config['aws_batch_subjob_vcpus'],
                     },
                     {
                         'type': 'MEMORY',
-                        'value': '15000',
+                        'value': config['aws_batch_subjob_memory'],
                     },
                 ],
                 'environment': [
