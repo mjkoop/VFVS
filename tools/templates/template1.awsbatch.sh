@@ -32,7 +32,6 @@
 ##################################################################################
 
 df -h
-cat /var/lib/cloud/data/instance-id
 
 export VFVS_WORKUNIT_SUBJOB=${AWS_BATCH_JOB_ARRAY_INDEX}
 
