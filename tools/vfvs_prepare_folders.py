@@ -60,6 +60,10 @@ def parse_config(filename):
     config['docking_scenario_inputfolders'] = config['docking_scenario_inputfolders'].split(
         ":")
 
+    if('summary_formats' in config):
+        config['summary_formats'] = config['summary_formats'].split(",")
+
+
     return config
 
 
@@ -144,7 +148,7 @@ def check_parameters(config):
                 print("* 'aws_batch_subjob_vcpus' must be set if batchsystem is 'awsbatch'")
                 error = 1
             if(empty_value(config, 'aws_batch_subjob_memory')):
-                print("* 'aws_batch_subjob_vcpus' must be set if batchsystem is 'awsbatch'")
+                print("* 'aws_batch_subjob_memory' must be set if batchsystem is 'awsbatch'")
                 error = 1
             if(empty_value(config, 'aws_batch_subjob_timeout')):
                 print("* 'aws_batch_subjob_timeout' must be set if batchsystem is 'awsbatch'")
@@ -178,6 +182,10 @@ def check_parameters(config):
                     print(f"* docking_scenario_inputfolders '{scenario_dir}' does not appear to be a directory in 'docking_scenario_basefolder'")
                     error = 1
 
+
+    if(empty_value(config, 'summary_formats')):
+        print("* 'summary_formats' must be set")
+        error = 1
 
 
     return error

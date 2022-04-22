@@ -26,6 +26,7 @@
 # 2021-06-29  Original version
 # 2021-08-02  Added additional handling for case where there is only 
 #             a single subjob in a job
+# 2022-04-20  Adding support for output into parquet format
 #
 # ---------------------------------------------------------------------------
 
@@ -44,6 +45,7 @@ import logging
 import time
 import shutil
 import hashlib
+import pandas as pd
 from pathlib import Path
 from botocore.config import Config
 
@@ -60,6 +62,10 @@ def process_config(ctx):
 
     # Determine full config.txt paths for scenarios
     ctx['main_config']['docking_scenarios'] = {}
+
+
+    if('summary_formats' not in ctx['main_config']):
+        ctx['main_config']['txt.gz']
 
     for index, scenario in enumerate(ctx['main_config']['docking_scenario_names']):
 
@@ -480,12 +486,12 @@ def scenario_collection_output_directory_tgz_hash(ctx, scenario, collection, res
     return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".tar.gz", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
 
 
-def scenario_collection_output_directory_txt_gz(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".txt.gz"))
+def scenario_collection_output_directory_txt_gz(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0, summary_format="txt.gz"):
+    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=f".{summary_format}"))
 
 
-def scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".txt.gz", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
+def scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0, summary_format="txt.gz"):
+    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=f".{summary_format}", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
 
 def get_workunit_information():
 
@@ -535,42 +541,84 @@ def get_subjob_config(ctx, workunit_id, subjob_id):
         raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. VFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
 
 
-def create_summary_file(ctx, scenario, collection, scenario_result):
+def create_summary_file(ctx, scenario, collection, scenario_result, output_format="txt.gz"):
 
     # Open the summary file
 
     summary_dir = scenario_collection_output_directory(
         ctx, scenario, collection, "summaries", tmp_prefix=1, skip_num=1)
+
     os.makedirs(summary_dir, exist_ok=True)
 
     os.chdir(summary_dir)
 
-    with gzip.open(f"{collection['collection_number']}.txt.gz", "wt") as summmary_fp:
-        summmary_fp.write(
-            "Tranch    Compound   average-score maximum-score  number-of-dockings ")
 
+    if(output_format == "txt.gz"):
+        with gzip.open(f"{collection['collection_number']}.txt.gz", "wt") as summmary_fp:
+            summmary_fp.write(
+                "Tranche    Compound   average-score maximum-score  number-of-dockings ")
+
+            for replica_index in range(scenario['replicas']):
+                replica_str = f"score-replica-{replica_index}"
+                summmary_fp.write(f"{replica_str}")
+            summmary_fp.write("\n")
+
+            # Now we need to go through each ligand
+            for ligand_key in scenario_result['ligands']:
+                ligand = scenario_result['ligands'][ligand_key]
+
+                if(len(ligand['scores']) > 0):
+
+                    max_score = max(ligand['scores'])
+                    avg_score = sum(ligand['scores']) / len(ligand['scores'])
+
+                    summmary_fp.write(
+                        f"{collection['collection_full_name']} {ligand_key}     {avg_score:3.1f}    {max_score:3.1f}     {len(ligand['scores']):5d}   ")
+                    for replica_index in range(scenario['replicas']):
+                        summmary_fp.write(
+                            f"{ligand['scores'][replica_index]:3.1f}   ")
+                    summmary_fp.write("\n")
+
+        return os.path.join(summary_dir, f"{collection['collection_number']}.txt.gz")
+
+    elif(output_format == "parquet"):
+        output_filename = f"{collection['collection_number']}.parquet"
+
+        columns = ['collection', 'compound', 'scenario', 'collection_number',
+                    'average_score', 'maximum_score', 'minimum_score', 'number_of_dockings','s3_download_path']
         for replica_index in range(scenario['replicas']):
-            replica_str = f"score-replica-{replica_index}"
-            summmary_fp.write(f"{replica_str}")
-        summmary_fp.write("\n")
+            columns.append(f"score_replica_{replica_index}")
 
-        # Now we need to go through each ligand
+        df = pd.DataFrame(columns = columns)
+
         for ligand_key in scenario_result['ligands']:
             ligand = scenario_result['ligands'][ligand_key]
 
             if(len(ligand['scores']) > 0):
 
-                max_score = max(ligand['scores'])
-                avg_score = sum(ligand['scores']) / len(ligand['scores'])
+                record = {
+                    'collection' : collection['collection_name'],
+                    'compound' : ligand_key,
+                    'scenario' : scenario['key'],
+                    'collection_number' : collection['collection_number'],
+                    'average_score' : sum(ligand['scores']) / len(ligand['scores']),
+                    'maximum_score' : max(ligand['scores']),
+                    'minimum_score' : min(ligand['scores']),
+                    'number_of_dockings' : len(ligand['scores']),
+                    's3_download_path' : collection['s3_download_path']
+                }
 
-                summmary_fp.write(
-                    f"{collection['collection_full_name']} {ligand_key}     {avg_score:3.1f}    {max_score:3.1f}     {len(ligand['scores']):5d}   ")
                 for replica_index in range(scenario['replicas']):
-                    summmary_fp.write(
-                        f"{ligand['scores'][replica_index]:3.1f}   ")
-                summmary_fp.write("\n")
+                    record[f"score_replica_{replica_index}"] = ligand['scores'][replica_index]
 
-    return os.path.join(summary_dir, f"{collection['collection_number']}.txt.gz")
+            df = df.append(record, ignore_index = True)
+
+        df.to_parquet(output_filename, compression='snappy')
+
+        return os.path.join(summary_dir, output_filename)
+    else:
+        logging.error(f"Invalid summary format of {output_format}")
+        exit(1)
 
 
 
@@ -789,8 +837,9 @@ def process(ctx):
             collection = collections[collection_key]
             scenario_result = scenario_results[scenario_key][collection_key]
 
-            output_name = create_summary_file(
-                ctx, scenario, collection, scenario_result)
+            for summary_format in ctx['main_config']['summary_formats']:
+                output_name = create_summary_file(
+                    ctx, scenario, collection, scenario_result, output_format=summary_format)
 
     # Generate the compressed files
 
@@ -833,12 +882,13 @@ def process(ctx):
                         }
                         )
 
-            copy_output(ctx,
-                        {
-                            'src': scenario_collection_output_directory_txt_gz(ctx, scenario, collection, 'summaries', tmp_prefix=1),
-                            'dest_path': scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, 'summaries', tmp_prefix=0),
-                        }
-                        )
+            for summary_format in ctx['main_config']['summary_formats']:
+                copy_output(ctx,
+                            {
+                                'src': scenario_collection_output_directory_txt_gz(ctx, scenario, collection, 'summaries', tmp_prefix=1, summary_format=summary_format),
+                                'dest_path': scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, 'summaries', tmp_prefix=0, summary_format=summary_format),
+                            }
+                            )
 
     # We also have one file at the collection level
     for collection_key in collections:
