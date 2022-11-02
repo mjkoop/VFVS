@@ -48,6 +48,563 @@ import hashlib
 import pandas as pd
 from pathlib import Path
 from botocore.config import Config
+from statistics import mean
+from multiprocessing import Process
+from multiprocessing import Queue
+from queue import Empty
+import math
+
+
+# Download
+# -
+# Get the file and move it to a local location
+#
+
+def downloader(download_queue, unpack_queue, tmp_dir):
+
+
+    botoconfig = Config(
+       retries = {
+          'max_attempts': 25,
+          'mode': 'standard'
+       }
+    )
+
+    s3 = boto3.client('s3', config=botoconfig)
+
+
+    while True:
+        try:
+            item = download_queue.get(timeout=20.5)
+        except Empty:
+            #print('Consumer: gave up waiting...', flush=True)
+            continue
+
+        if item is None:
+            break
+
+
+        item['temp_dir'] = tempfile.mkdtemp(prefix=tmp_dir)
+        item['local_path'] = f"{item['temp_dir']}/tmp.{item['ext']}"
+
+
+        # Move the data either from S3 or a shared filesystem
+
+        if('s3_download_path' in item['collection']):
+
+            remote_path = item['collection']['s3_download_path']
+            job_bucket = item['collection']['s3_bucket']
+
+            try:
+                with open(item['local_path'], 'wb') as f:
+                    s3.download_fileobj(job_bucket, remote_path, f)
+            except botocore.exceptions.ClientError as error:
+                    logging.error(f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}, ({error})")
+                    continue
+
+        elif('sharedfs_path' in item['collection']):
+
+            shutil.copyfile(Path(item['collection']['sharedfs_path']), item['local_path'])
+
+
+        # Move it to the next step if there's space
+
+        while unpack_queue.qsize() > 35:
+            time.sleep(0.2)
+
+        unpack_queue.put(item)
+
+
+
+
+def untar(unpack_queue, collection_queue, sensor_screen_mode, sensor_screen_count):
+    print('Unpacker: Running', flush=True)
+
+    while True:
+        try:
+            item = unpack_queue.get(timeout=20.5)
+        except Empty:
+            #print('unpacker: gave up waiting...', flush=True)
+            continue
+
+        # check for stop
+        if item is None:
+            break
+
+        item['ligands'] = unpack_item(item, sensor_screen_mode, sensor_screen_count)
+
+        # Next step is to process this
+        while collection_queue.qsize() > 35:
+            time.sleep(0.2)
+
+        collection_queue.put(item)
+
+
+
+def unpack_item(item, sensor_screen_mode, sensor_screen_count):
+
+    ligands = {}
+
+    os.chdir(item['temp_dir'])
+    try:
+        tar = tarfile.open(item['local_path'])
+        for member in tar.getmembers():
+            if(not member.isdir()):
+                _, ligand = member.name.split("/", 1)
+
+                if(ligand == ".listing"):
+                    continue
+
+                ligand_name = ligand.split(".")[0]
+
+                ligands[ligand_name] = {
+                    'path':  os.path.join(item['temp_dir'], item['collection']['collection_number'], ligand),
+                    'collection_key': item['collection_key']
+                }
+
+        tar.extractall()
+        tar.close()
+    except Exception as err:
+        logging.error(
+            f"ERR: Cannot open {item['local_path']} type: {str(type(err))}, err: {str(err)}")
+        return None
+
+    if(int(sensor_screen_mode) == 1):
+
+        sensor_screen_ligands = {}
+
+        # We should read the sparse file to know which ligands we actually need to keep
+        with open(os.path.join(item['temp_dir'], item['collection']['collection_number'], ".listing"), "r") as read_file:
+            for index, line in enumerate(read_file):
+                line = line.strip()
+
+                screen_collection_key, screen_ligand_name, screen_index = line.split(",")
+
+                if(int(screen_index) >= int(sensor_screen_count)):
+                    continue
+
+                sensor_screen_ligands[screen_ligand_name] = ligands[screen_ligand_name]
+                sensor_screen_ligands[screen_ligand_name]['collection_key'] = screen_collection_key
+
+        return sensor_screen_ligands
+
+    else:
+        return ligands
+
+
+
+
+
+def collection_process(ctx, collection_queue, docking_queue, summary_queue):
+
+    while True:
+        try:
+            item = collection_queue.get(timeout=20.5)
+        except Empty:
+            #print('unpacker: gave up waiting...', flush=True)
+            continue
+
+        # check for stop
+        if item is None:
+            break
+
+        expected_ligands = 0
+        completions_per_ligand = 0
+
+
+        # How many do we run per ligand?
+        for scenario_key in ctx['main_config']['docking_scenarios']:
+            scenario = ctx['main_config']['docking_scenarios'][scenario_key]
+            for replica_index in range(scenario['replicas']):
+                completions_per_ligand += 1
+
+
+        # Process every ligand after making sure it is valid
+
+        for ligand_key in item['ligands']:
+            ligand = item['ligands'][ligand_key]
+
+            coords = {}
+            skip_ligand = 0
+
+            with open(ligand['path'], "r") as read_file:
+                for index, line in enumerate(read_file):
+                    match = re.search(r'(?P<letters>\s+(B|Si|Sn)\s+)', line)
+                    if(match):
+                        matches = match.groupdict()
+                        logging.error(
+                            f"Found {matches['letters']} in {ligand}. Skipping.")
+                        skip_reason = f"failed(ligand_elements:{matches['letters']})"
+                        skip_reason_json = f"ligand includes elements: {matches['letters']})"
+                        skip_ligand = 1
+                        break
+
+                    match = re.search(r'^ATOM', line)
+                    if(match):
+                        parts = line.split()
+                        coord_str = ":".join(parts[5:8])
+
+                        if(coord_str in coords):
+                            logging.error(
+                                f"Found duplicate coordinates in {ligand}. Skipping.")
+                            skip_reason = f"failed(ligand_coordinates)"
+                            skip_reason_json = f"duplicate coordinates"
+                            skip_ligand = 1
+                            break
+                        coords[coord_str] = 1
+
+            if(skip_ligand == 0):
+
+                # We can submit this for processing
+                smi = get_smi(ctx['main_config']['ligand_library_format'], ligand['path'])
+                submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], smi, item['temp_dir'])
+                expected_ligands += completions_per_ligand
+
+            else:
+                # log this to know we skipped
+                # put on the logging queue
+                pass
+
+        # Let the summary queue know that it can delete the directory after len(ligands)
+        # number of ligands have been processed
+
+
+        summary_item = {
+            'type': "delete",
+            'temp_dir': item['temp_dir'],
+            'collection_key': item['collection_key'],
+            'expected_completions': expected_ligands
+        }
+
+        summary_queue.put(summary_item)
+
+
+
+
+def get_smi(ligand_format, ligand_path):
+
+    valid_formats = ['pdbqt', 'mol2']
+
+    if ligand_format in valid_formats:
+        with open(ligand_path, "r") as read_file:
+            for line in read_file:
+                line = line.strip()
+                match = re.search(r"SMILES:\s*(?P<smi>.*)$", line)
+                if(match):
+                    return match.group('smi')
+                match = re.search(r"SMILES_current:\s*(?P<smi>.*)$", line)
+                if(match):
+                    return match.group('smi')
+
+    return "N/A"
+
+
+def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, collection_key, smi, temp_dir):
+
+    for scenario_key in ctx['main_config']['docking_scenarios']:
+        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
+        for replica_index in range(scenario['replicas']):
+            docking_item = {
+                'ligand_key': ligand_name,
+                'ligand_path': ligand_path,
+                'scenario_key': scenario_key,
+                'collection_key': collection_key,
+                'smi': smi,
+                'config_path': scenario['config'],
+                'program': scenario['program'],
+                'program_long': scenario['program_long'],
+                'input_files_dir':  os.path.join(ctx['temp_dir'], "vf_input", "input-files"),
+                'timeout': int(ctx['main_config']['program_timeout']),
+                'tools_path': ctx['tools_path'],
+                'threads_per_docking': int(ctx['main_config']['threads_per_docking']),
+                'temp_dir': temp_dir
+            }
+
+        docking_queue.put(docking_item)
+
+    while docking_queue.qsize() > 100:
+            time.sleep(0.2)
+
+
+def docking_process(docking_queue, summary_queue):
+
+    while True:
+        try:
+            item = docking_queue.get(timeout=20.5)
+        except Empty:
+            #print('unpacker: gave up waiting...', flush=True)
+            continue
+
+        # check for stop
+        if item is None:
+            break
+
+        print(f"processing {item['ligand_key']}")
+
+        item['output_path'] = f"{item['temp_dir']}/{item['ligand_key']}.output"
+        item['ligand_path.old'] = item['ligand_path']
+        item['ligand_path'] = f"{item['temp_dir']}/{item['ligand_key']}.pdbqt"
+
+        # COMPND -- seems to be invalid?
+        with open(item['ligand_path'], "w") as write_file:
+            with open(item['ligand_path.old'], "r") as read_file:
+                for line in read_file:
+                    if(re.search(r"TITLE|SOURCE|KEYWDS|EXPDTA|COMPND|HEADER|AUTHOR", line)):
+                        continue
+                    write_file.write(line)
+
+
+        start_time = time.perf_counter()
+
+        # x
+        try:
+            cmd = program_runstring_array(item)
+        except RuntimeError as err:
+            logging.error(f"Invalid cmd generation for {item['ligand_key']} (program: '{item['program']}')")
+            raise(err)
+
+        try:
+            ret = subprocess.run(cmd, capture_output=True,
+                         text=True, cwd=item['input_files_dir'], timeout=item['timeout'])
+        except subprocess.TimeoutExpired as err:
+            logging.error(f"timeout on {item['ligand_key']}")
+
+        if ret.returncode == 0:
+
+            if(item['program'] == "qvina02"
+                    or item['program'] == "qvina_w"
+                    or item['program'] == "vina"
+                    or item['program'] == "vina_carb"
+                    or item['program'] == "vina_xb"
+                    or item['program'] == "gwovina"
+               ):
+
+                match = re.search(
+                    r'^\s+1\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE)
+                if(match):
+                    matches = match.groupdict()
+                    item['score'] = float(matches['value'])
+                    item['status'] = "success"
+                else:
+                    logging.error(
+                        f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+
+            elif(task['program'] == "smina"):
+                found = 0
+                for line in reversed(ret.stdout.splitlines()):
+                    match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
+                    if(match):
+                        matches = match.groupdict()
+                        item['score'] = float(matches['value'])
+                        item['status'] = "success"
+                        found = 1
+                        break
+                if(found == 0):
+                    logging.error(
+                        f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+
+            elif(task['program'] == "adfr"):
+                logging.error(
+                    f"adfr not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+            elif(task['program'] == "plants"):
+                logging.error(
+                    f"plants not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+
+        else:
+            logging.error(
+                f"Non zero return code for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+            logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
+
+        # Place output into files
+        #with open(task['log_path'], "w") as output_f:
+        #    output_f.write(f"STDOUT:\n{ret.stdout}\n")
+        #    output_f.write(f"STDERR:\n{ret.stderr}\n")
+
+        end_time = time.perf_counter()
+
+        item['seconds'] = end_time - start_time
+        print(f"processing {item['ligand_key']} - done in {item['seconds']}")
+
+        while summary_queue.qsize() > 200:
+            time.sleep(0.2)
+
+
+        item['type'] = "docking_complete"
+        summary_queue.put(item)
+
+
+
+def check_for_completion_of_collection_key(collection_completions, collection_key):
+    current_completions = collection_completions[collection_key]['current_completions']
+    expected_completions = collection_completions[collection_key]['expected_completions']
+
+    if current_completions == expected_completions:
+        shutil.rmtree(collection_completions[collection_key]['temp_dir'])
+        collection_completions.pop(collection_key, None)
+
+
+
+def summary_process(ctx, summary_queue, upload_queue):
+
+    print("starting summary process")
+
+    dockings_processed = 0
+    summary_data = {}
+
+    collection_completions = {}
+
+    while True:
+        try:
+            item = summary_queue.get()
+        except Empty:
+            #print('unpacker: gave up waiting...', flush=True)
+            continue
+
+        # check for stop
+        if item is None:
+            # clean up anything extra that is around
+            if(dockings_processed > 0):
+                generate_summary_file(ctx, summary_data, upload_queue, ctx['temp_dir'])
+
+            break
+
+
+        if(item['type'] == "delete"):
+            if item['collection_key'] in collection_completions:
+                collection_completions[item['collection_key']]['expected_completions'] = item['expected_completions']
+                collection_completions[item['collection_key']]['temp_dir'] = item['temp_dir']
+            else:
+                collection_completions[item['collection_key']] = {
+                    'expected_completions':item['expected_completions'],
+                    'current_completions': 0,
+                    'temp_dir': item['temp_dir']
+                }
+
+            check_for_completion_of_collection_key(collection_completions, item['collection_key'])
+
+        elif(item['type'] == "docking_complete"):
+            # Save off the data we need
+
+            summary_key = f"({item['ligand_key']})({item['scenario_key']})"
+            log_index = int(dockings_processed / 1000)
+
+            if summary_key not in summary_data:
+                summary_data[summary_key] = {
+                    'ligand': item['ligand_key'],
+                    'smi': item['smi'],
+                    'collection_key': item['collection_key'],
+                    'scenario': item['scenario_key'],
+                    'scores': [ item['score'] ]
+                }
+            else:
+                summary_data[summary_key]['scores'].append(item['score'])
+
+
+            dockings_processed += 1
+
+
+            # See if this was the last completion for this collection_key
+
+            if item['collection_key'] in collection_completions:
+                collection_completions[item['collection_key']]['current_completions'] += 1
+                check_for_completion_of_collection_key(collection_completions, item['collection_key'])
+            else:
+                collection_completions[item['collection_key']] = {
+                    'expected_completions': -1,
+                    'current_completions': 1,
+                    'temp_dir': ""
+                }
+
+
+        else:
+            logging.error(f"received invalid summary completion {item['type']}")
+            raise
+
+
+
+
+
+def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
+
+    # Need to run all of the averages
+    for summary_key, summary_value in summary_data.items():
+
+        for index, score in enumerate(summary_value['scores']):
+            summary_value[f"score_{index}"] = score
+
+        summary_value['score_average'] = mean(summary_value['scores'])
+        summary_value.pop('scores', None)
+
+    # Now we can generate a parquet file with all of the data
+    df = pd.DataFrame.from_dict(summary_data, "index")
+
+
+    upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+
+    uploader_item = {
+        'storage_type': ctx['main_config']['job_storage_mode'],
+        'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
+        's3_bucket': ctx['main_config']['object_store_job_bucket'],
+        'local_path': f"{upload_tmp_dir}/summary.parquet",
+        'temp_dir': upload_tmp_dir
+    }
+
+    df.to_parquet(uploader_item['local_path'], compression='gzip')
+    upload_queue.put(uploader_item)
+
+
+
+def upload_process(ctx, upload_queue):
+
+    print('Uploader: Running', flush=True)
+
+    botoconfig = Config(
+       retries = {
+          'max_attempts': 25,
+          'mode': 'standard'
+       }
+    )
+
+    s3 = boto3.client('s3', config=botoconfig)
+
+    while True:
+        try:
+            item = upload_queue.get(timeout=20.5)
+        except Empty:
+            #print('unpacker: gave up waiting...', flush=True)
+            continue
+
+        # check for completion
+        if item is None:
+
+            # clean up anything extra that is around
+            break
+
+        # Save off the data we need
+        # Basically.. if s3 then use boto3
+
+        if(item['storage_type'] == "s3"):
+            try:
+                print(f"Uploading to {item['remote_path']}")
+                response = s3.upload_file(item['local_path'], item['s3_bucket'], item['remote_path'])
+            except botocore.exceptions.ClientError as e:
+                logging.error(e)
+                raise
+
+        else:
+            # if sharedfs.. .then just do a copy
+
+            parent_directory = Path(Path(item['remote_path']).parent)
+            parent_directory.mkdir(parents=True, exist_ok=True)
+
+            shutil.copyfile(item['local_path'], item['remote_path'])
+
+
+        # Get rid of the temp directory
+        shutil.rmtree(item['temp_dir'])
+
+
+
 
 
 
@@ -171,22 +728,6 @@ def get_workunit_from_sharedfs(ctx, workunit_id, subjob_id, job_tar, download_di
     ctx['main_config'] = all_config['config']
 
 
-def get_smi(ligand_format, ligand_path):
-
-    valid_formats = ['pdbqt', 'mol2']
-
-    if ligand_format in valid_formats:
-        with open(ligand_path, "r") as read_file:
-            for line in read_file:
-                line = line.strip()
-                match = re.search(r"SMILES:\s*(?P<smi>.*)$", line)
-                if(match):
-                    return match.group('smi')
-
-    return "N/A"
-
-
-
 # Generate the run command for a given program
 
 def program_runstring_array(task):
@@ -222,326 +763,8 @@ def program_runstring_array(task):
     else:
         raise RuntimeError(f"Invalid program type of {task['program']}")
 
-    #elif(task['program'] == "adfr"):
-    #    # TODO: convert config.txt and remove all newlines and pass in
-    #
-    #    adfr_config_options = ""
-    #
-    #    cmd = [
-    #        'adfr',
-    #        '-l', task['ligand_path'],
-    #        '--jobName', 'adfr',
-    #        adfr_config_options
-    #    ]
-        #                     adfr_configfile_options=$(cat ${docking_scenario_inputfolder}/config.txt | tr -d "\n")
-    #            { bin/time_bin -f " Docking timings \n-------------------------------------- \n user real system \n %U %e %S \n------------------------------------- \n" adfr -l ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/input-files/ligands/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}.${ligand_library_format} --jobName adfr ${adfr_configfile_options} 2> >(tee ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output.tmp 1>&2) ; } 2>&1
-    #            rename "_adfr_adfr.out" "" ${next_ligand}_replica-${docking_replica_index} ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output-files/incomplete/${docking_scenario_name}/logfiles/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}*
-    #
-    #            score_value=$(grep -m 1 "FEB" ${VF_TMPDIR}/${USER}/VFVS/${VF_JOBLETTER}/${VF_QUEUE_NO_12}/${VF_QUEUE_NO}/output-files/incomplete/${docking_scenario_name}/logfiles/${next_ligand_collection_metatranch}/${next_ligand_collection_tranch}/${next_ligand_collection_ID}/${next_ligand}_replica-${docking_replica_index}.${ligand_library_format} | awk -F ': ' '{print $(NF)}')
-    #elif(task['program'] == "plants"):
-    #    # TODO implement plants
-    #    adfr_config_options = ""
-
     return cmd
 
-# Individual tasks that will be completed in parallel
-
-
-def process_ligand(task):
-
-    start_time = time.perf_counter()
-
-    completion_event = {
-        'collection_key': task['collection_key'],
-        'ligand_key': task['ligand_key'],
-        'scenario_key': task['scenario_key'],
-        'replica_index': task['replica_index'],
-        'ligand_path': task['ligand_path'],
-        'output_path': task['output_path'],
-        'log_path': task['log_path'],
-        'status': "failed(docking)"
-    }
-
-    if(task['get_smi'] == True):
-        completion_event['smi'] = get_smi(task['ligand_format'], task['ligand_path'])
-
-    try:
-        cmd = program_runstring_array(task)
-    except RuntimeError as err:
-        logging.error(f"Invalid cmd generation for {task['ligand_key']} (program: '{task['program']}')")
-        raise(err)
-
-    try:
-        ret = subprocess.run(cmd, capture_output=True,
-                         text=True, cwd=task['input_files_dir'], timeout=task['timeout'])
-    except subprocess.TimeoutExpired as err:
-        logging.error(f"timeout on {task['ligand_key']}")
-        end_time = time.perf_counter()
-        completion_event['seconds'] = end_time - start_time
-        return completion_event
-
-    if ret.returncode == 0:
-
-        if(task['program'] == "qvina02"
-                or task['program'] == "qvina_w"
-                or task['program'] == "vina"
-                or task['program'] == "vina_carb"
-                or task['program'] == "vina_xb"
-                or task['program'] == "gwovina"
-           ):
-
-            match = re.search(
-                r'^\s+1\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE)
-            if(match):
-                matches = match.groupdict()
-                completion_event['score'] = float(matches['value'])
-                completion_event['status'] = "success"
-            else:
-                logging.error(
-                    f"Could not find score for {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
-
-        elif(task['program'] == "smina"):
-            found = 0
-            for line in reversed(ret.stdout.splitlines()):
-                match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
-                if(match):
-                    matches = match.groupdict()
-                    completion_event['score'] = float(matches['value'])
-                    completion_event['status'] = "success"
-                    found = 1
-                    break
-            if(found == 0):
-                logging.error(
-                    f"Could not find score for {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
-
-        elif(task['program'] == "adfr"):
-            logging.error(
-                f"adfr not implemented {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
-        elif(task['program'] == "plants"):
-            logging.error(
-                f"plants not implemented {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
-
-    else:
-        logging.error(
-            f"Non zero return code for {task['collection_key']} {task['ligand_key']} {task['scenario_key']} {task['replica_index']}")
-        logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
-
-    # Place output into files
-    with open(task['log_path'], "w") as output_f:
-        output_f.write(f"STDOUT:\n{ret.stdout}\n")
-        output_f.write(f"STDERR:\n{ret.stderr}\n")
-
-    end_time = time.perf_counter()
-
-    completion_event['seconds'] = end_time - start_time
-
-    logging.info(f"Finished {task['ligand_key']} in {completion_event['seconds']} sec")
-
-    return completion_event
-
-def get_collection_data(ctx, collection):
-    
-    ligands = {}
-
-    # Make a place to put the data
-    download_dir = Path(ctx['temp_dir']) / collection['collection_name']
-    download_dir.mkdir(parents=True, exist_ok=True)
-    collection_file = download_dir / f"{collection['collection_number']}.tar.gz"
-
-    if(ctx['job_storage_mode'] == "s3"):
-        
-        try:
-            with collection_file.open(mode = 'wb') as f:
-                ctx['s3'].download_fileobj(collection['s3_bucket'], collection['s3_download_path'], f)
-        except botocore.exceptions.ClientError as error:
-            logging.error(f"Failed to download from S3 {collection['s3_bucket']}/{collection['s3_download_path']} to {str(collection_file)}, ({error})")
-            raise
-    else:
-        shutil.copyfile(Path(collection['sharedfs_path']), collection_file)
-
-    # Extract the ligands from the file
-
-    os.chdir(download_dir)
-
-    try:
-        tar = tarfile.open(collection_file)
-        for member in tar.getmembers():
-            if(not member.isdir()):
-                _, ligand = member.name.split("/", 1)
-
-                ligands[ligand] = {
-                    'path':  os.path.join(download_dir, collection['collection_number'], ligand)
-                }
-
-        tar.extractall()
-        tar.close()
-    except Exception as err:
-        logging.error(
-            f"ERR: Cannot open {collection_file} type: {str(type(err))}, err: {str(err)}")
-        return None
-
-
-    return ligands
-
-
-
-def preprocess_collection(ctx, collection):
-    collection['ligands'] = get_collection_data(ctx, collection)
-    collection['log'] = []
-    collection['log_json'] = []
-
-
-def collection_output(ctx, collection, result_type, skip_num=0, tmp_prefix=0, append="", output_addressing="metatranche"):
-    path_components = []
-
-    if(tmp_prefix):
-        path_components.append(ctx['temp_dir'])
-
-    if(output_addressing == "hash"):
-
-        if(skip_num != 1):
-            hash_string = get_collection_hash(collection['collection_name'], collection['collection_number'])
-
-            path_components = [
-                hash_string[0:2],
-                hash_string[2:4],
-                ctx['main_config']['job_letter'],
-                "output",
-                result_type,
-                collection['collection_name'],
-                get_formatted_collection_number(collection['collection_number'])
-            ]
-
-        else:
-            hash_string = get_collection_hash(collection['collection_name'], "0")
-
-            path_components = [
-                hash_string[0:2],
-                hash_string[2:4],
-                ctx['main_config']['job_letter'],
-                "output",
-                result_type,
-                collection['collection_name']
-            ]
-
-    else:
-
-        path_components.extend([
-            "output", result_type,
-            collection['collection_tranche'], collection['collection_name']
-        ])
-
-        if(skip_num != 1):
-            path_components.append(collection['collection_number'])
-
-    if(append != ""):
-        path_components[-1] = f"{path_components[-1]}{append}"
-
-    return path_components
-
-
-
-def collection_output_directory_status_gz(ctx, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*collection_output(ctx, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".status.gz"))
-
-def collection_output_directory_status_gz_hash(ctx, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*collection_output(ctx, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".status.gz", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
-
-def collection_output_directory_status_json_gz(ctx, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*collection_output(ctx, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".json.gz"))
-
-def collection_output_directory_status_json_gz_hash(ctx, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*collection_output(ctx, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".json.gz", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
-
-def collection_output_directory(ctx, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*collection_output(ctx, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix))
-
-def get_formatted_collection_number(collection_number):
-    return f"{int(collection_number):07}"
-
-def get_collection_hash(collection_name, collection_number):
-
-    formatted_collection_number = get_formatted_collection_number(collection_number)
-    string_to_hash = f"{collection_name}/{formatted_collection_number}"
-    return hashlib.sha256(string_to_hash.encode()).hexdigest()
-
-
-def scenario_collection_output(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0, append="", output_addressing="metatranche"):
-    path_components = []
-
-    if(tmp_prefix):
-        path_components.append(ctx['temp_dir'])
-
-
-    if(output_addressing == "hash"):
-
-        if(skip_num != 1):
-            hash_string = get_collection_hash(collection['collection_name'], collection['collection_number'])
-
-            path_components = [
-                hash_string[0:2],
-                hash_string[2:4],
-                ctx['main_config']['job_letter'],
-                "output",
-                scenario['key'],
-                result_type,
-                collection['collection_name'],
-                get_formatted_collection_number(collection['collection_number'])
-            ]
-
-            if(append != ""):
-                path_components[-1] = f"{path_components[-1]}{append}"
-        else:
-            hash_string = get_collection_hash(collection['collection_name'], "0")
-
-            path_components = [
-                hash_string[0:2],
-                hash_string[2:4],
-                ctx['main_config']['job_letter'],
-                "output",
-                scenario['key'],
-                result_type,
-                collection['collection_name']
-            ]
-
-            if(append != ""):
-                path_components[-1] = f"{path_components[-1]}{append}"
-
-    else:
-
-        path_components.extend([
-            "output", scenario['key'], result_type,
-            collection['collection_tranche'], collection['collection_name']
-        ])
-
-        if(skip_num != 1):
-            path_components.append(collection['collection_number'])
-
-        if(append != ""):
-            path_components[-1] = f"{path_components[-1]}{append}"
-
-
-    return path_components
-
-
-def scenario_collection_output_directory(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix))
-
-
-def scenario_collection_output_directory_tgz(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".tar.gz"))
-
-
-def scenario_collection_output_directory_tgz_hash(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=".tar.gz", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
-
-
-def scenario_collection_output_directory_txt_gz(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0, summary_format="txt.gz"):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=f".{summary_format}"))
-
-
-def scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, result_type, skip_num=0, tmp_prefix=0, summary_format="txt.gz"):
-    return os.path.join(*scenario_collection_output(ctx, scenario, collection, result_type, skip_num=skip_num, tmp_prefix=tmp_prefix, append=f".{summary_format}", output_addressing=ctx['main_config']['object_store_job_addressing_mode']))
 
 def get_workunit_information():
 
@@ -592,108 +815,6 @@ def get_subjob_config(ctx, workunit_id, subjob_id):
         raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. VFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
 
 
-def create_summary_file(ctx, scenario, collection, scenario_result, output_format="txt.gz", get_smi=False):
-
-    # Open the summary file
-
-    summary_dir = scenario_collection_output_directory(
-        ctx, scenario, collection, "summaries", tmp_prefix=1, skip_num=1)
-
-    os.makedirs(summary_dir, exist_ok=True)
-
-    os.chdir(summary_dir)
-
-
-    if(output_format == "txt.gz"):
-        with gzip.open(f"{collection['collection_number']}.txt.gz", "wt") as summmary_fp:
-
-            if(get_smi):
-                summmary_fp.write(
-                    "Tranche    Compound   SMILES   average-score maximum-score  number-of-dockings ")
-            else:
-                summmary_fp.write(
-                    "Tranche    Compound   average-score maximum-score  number-of-dockings ")
-
-            for replica_index in range(scenario['replicas']):
-                replica_str = f"score-replica-{replica_index}"
-                summmary_fp.write(f"{replica_str}")
-            summmary_fp.write("\n")
-
-            # Now we need to go through each ligand
-            for ligand_key in scenario_result['ligands']:
-                ligand = scenario_result['ligands'][ligand_key]
-
-                if(len(ligand['scores']) > 0):
-
-                    max_score = max(ligand['scores'])
-                    avg_score = sum(ligand['scores']) / len(ligand['scores'])
-
-                    if(get_smi):
-                        summmary_fp.write(
-                            f"{collection['collection_full_name']} {ligand_key}     {ligand['smi']}     {avg_score:3.1f}    {max_score:3.1f}     {len(ligand['scores']):5d}   ")
-                    else:
-                        summmary_fp.write(
-                            f"{collection['collection_full_name']} {ligand_key}     {avg_score:3.1f}    {max_score:3.1f}     {len(ligand['scores']):5d}   ")
-
-
-                    for replica_index in range(scenario['replicas']):
-                        summmary_fp.write(
-                            f"{ligand['scores'][replica_index]:3.1f}   ")
-                    summmary_fp.write("\n")
-
-        return os.path.join(summary_dir, f"{collection['collection_number']}.txt.gz")
-
-    elif(output_format == "parquet"):
-        output_filename = f"{collection['collection_number']}.parquet"
-
-        columns = ['collection', 'compound', 'scenario', 'collection_number',
-                    'average_score', 'maximum_score', 'minimum_score', 'number_of_dockings','s3_download_path']
-
-        if(get_smi):
-            columns.append("SMILES")
-
-        for replica_index in range(scenario['replicas']):
-            columns.append(f"score_replica_{replica_index}")
-
-        df = pd.DataFrame(columns = columns)
-
-        for ligand_key in scenario_result['ligands']:
-            ligand = scenario_result['ligands'][ligand_key]
-
-            if(len(ligand['scores']) > 0):
-
-                record = {
-                    'collection' : collection['collection_name'],
-                    'compound' : ligand_key,
-                    'scenario' : scenario['key'],
-                    'collection_number' : collection['collection_number'],
-                    'average_score' : sum(ligand['scores']) / len(ligand['scores']),
-                    'maximum_score' : max(ligand['scores']),
-                    'minimum_score' : min(ligand['scores']),
-                    'number_of_dockings' : len(ligand['scores'])
-                }
-
-                if(get_smi):
-                    record['SMILES'] = ligand['smi']
-
-                if(ctx['job_storage_mode'] == "s3"):
-                    record['s3_download_path'] = collection['s3_download_path']
-                else:
-                    record['s3_download_path'] = collection['sharedfs_path']
-
-                for replica_index in range(scenario['replicas']):
-                    record[f"score_replica_{replica_index}"] = ligand['scores'][replica_index]
-
-            df = df.append(record, ignore_index = True)
-
-        df.to_parquet(output_filename, compression='snappy')
-
-        return os.path.join(summary_dir, output_filename)
-    else:
-        logging.error(f"Invalid summary format of {output_format}")
-        exit(1)
-
-
 
 
 def process(ctx):
@@ -721,6 +842,12 @@ def process(ctx):
 
     process_config(ctx)
 
+
+    ctx['workunit_id'] = workunit_id
+    ctx['subjob_id'] = subjob_id
+
+    ctx.pop('s3', None)
+
     print(ctx['temp_dir'])
 
     ligand_format = ctx['main_config']['ligand_library_format']
@@ -734,326 +861,81 @@ def process(ctx):
     
     subjob = ctx['subjob_config']
 
-    collections = {}
+
+    download_queue = Queue()
+    unpack_queue = Queue()
+    collection_queue = Queue()
+    docking_queue = Queue()
+    summary_queue = Queue()
+    upload_queue = Queue()
+
+
+    downloader_processes = []
+    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+        downloader_processes.append(Process(target=downloader, args=(download_queue, unpack_queue, ctx['temp_dir'])))
+        downloader_processes[i].start()
+
+    unpacker_processes = []
+    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+        unpacker_processes.append(Process(target=untar, args=(unpack_queue, collection_queue, ctx['main_config']['sensor_screen_mode'], ctx['main_config']['sensor_screen_count'])))
+        unpacker_processes[i].start()
+
+    collection_processes = []
+    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+        # collection_process(ctx, collection_queue, docking_queue, summary_queue)
+        collection_processes.append(Process(target=collection_process, args=(ctx, collection_queue, docking_queue, summary_queue)))
+        collection_processes[i].start()
+
+    docking_processes = []
+    for i in range(0, ctx['vcpus_to_use']):
+        # docking_process(docking_queue, summary_queue)
+        docking_processes.append(Process(target=docking_process, args=(docking_queue, summary_queue)))
+        docking_processes[i].start()
+
+    # There should never be more than one summary process
+    summary_processes = []
+    summary_processes.append(Process(target=summary_process, args=(ctx, summary_queue, upload_queue)))
+    summary_processes[0].start()
+
+    uploader_processes = []
+    for i in range(0, 1):
+        # docking_process(docking_queue, summary_queue)
+        uploader_processes.append(Process(target=upload_process, args=(ctx, upload_queue)))
+        uploader_processes[i].start()
+
     for collection_key in subjob['collections']:
         collection = subjob['collections'][collection_key]
- 
-        collection_full_name = collection['collection_full_name']
-        collection_count = collection['ligand_count']
 
-        preprocess_collection(ctx, collection)
-        collections[collection_full_name] = collection
+        download_item = {
+            'collection_key': collection_key,
+            'collection': subjob['collections'][collection_key],
+            'ext': "tar.gz",
+        }
 
+        download_queue.put(download_item)
 
-    logging.info(f"Finished processing collections")
+        # Don't overflow the queues
+        while download_queue.qsize() > 25:
+            time.sleep(0.2)
 
-    # Setup the data structure where we will keep the summary information
-    scenario_results = {}
-    for scenario_key in ctx['main_config']['docking_scenarios']:
-        scenario_results[scenario_key] = {}
 
-        for collection_key in collections:
-            collection = collections[collection_key]
+    flush_queue(download_queue, downloader_processes, "download")
+    flush_queue(unpack_queue, unpacker_processes, "unpack")
+    flush_queue(collection_queue, collection_processes, "collection")
+    flush_queue(docking_queue, docking_processes, "docking")
+    flush_queue(summary_queue, summary_processes, "summary")
+    flush_queue(upload_queue, uploader_processes, "upload")
 
-            scenario_results[scenario_key][collection_key] = {'ligands': {}}
 
-            for ligand_key in collection['ligands']:
-                scenario_results[scenario_key][collection_key]['ligands'][ligand_key] = {
-                }
-                scenario_results[scenario_key][collection_key]['ligands'][ligand_key]['scores'] = [
-                ]
+def flush_queue(queue, processes, description):
+    logging.error(f"Sending {description} flush")
+    for process in processes:
+        queue.put(None)
+    logging.error(f"Join {description}")
+    for process in processes:
+        process.join()
+    logging.error(f"Finished Join of {description}")
 
-    # See if any of the ligands in the collections are invalid for processing
-
-    for collection_key in collections:
-        collection = collections[collection_key]
-
-        ligands_to_skip = []
-
-        for ligand_key in collection['ligands']:
-            ligand = collection['ligands'][ligand_key]
-
-            coords = {}
-            skip_ligand = 0
-            skip_reason = ""
-            skip_reason_json = ""
-
-            logging.debug(f"pre-processing {ligand_key}")
-
-            # Check to see if ligand contains B, Si, Sn or has duplicate coordinates
-            with open(ligand['path'], "r") as read_file:
-                for index, line in enumerate(read_file):
-
-                    match = re.search(r'(?P<letters>\s+(B|Si|Sn)\s+)', line)
-                    if(match):
-                        matches = match.groupdict()
-                        logging.error(
-                            f"Found {matches['letters']} in {collection_full_name}/{ligand_key}. Skipping.")
-                        skip_reason = f"failed(ligand_elements:{matches['letters']})"
-                        skip_reason_json = f"ligand includes elements: {matches['letters']})"
-                        skip_ligand = 1
-                        break
-
-                    match = re.search(r'^ATOM', line)
-                    if(match):
-                        parts = line.split()
-                        coord_str = ":".join(parts[5:8])
-
-                        if(coord_str in coords):
-                            logging.error(
-                                f"Found duplicate coordinates in {collection_full_name}/{ligand_key}. Skipping.")
-                            skip_reason = f"failed(ligand_coordinates)"
-                            skip_reason_json = f"duplicate coordinates"
-                            skip_ligand = 1
-                            break
-                        coords[coord_str] = 1
-
-            if skip_ligand:
-                collection['log'].append(f"{ligand_key} {skip_reason}")
-                collection['log_json'].append(
-                    {'ligand': ligand_key, 'status': 'failed', 'info': skip_reason_json})
-                ligands_to_skip.append(ligand_key)
-
-        for ligand_key in ligands_to_skip:
-            collection['ligands'].pop(ligand_key, None)
-
-    # Create the task list based on the scenarios and replicas required
-    tasklist = []
-    for scenario_key in ctx['main_config']['docking_scenarios']:
-        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
-
-        logging.debug(f"Generating scenario information for '{scenario_key}', program '{scenario['program']}'")
-
-        # For each collection
-        for collection_key in collections:
-            collection = collections[collection_key]
-
-            # Setup the directories for this scenario / collection combination
-
-            results_dir = scenario_collection_output_directory(
-                ctx, scenario, collection, "results", tmp_prefix=1)
-            log_dir = scenario_collection_output_directory(
-                ctx, scenario, collection, "logfiles", tmp_prefix=1)
-
-            os.makedirs(results_dir, exist_ok=True)
-            os.makedirs(log_dir, exist_ok=True)
-
-            # For each ligand, iterate through each replica and generate a task that can be
-            # parallel processed
-
-            for ligand_key in collection['ligands']:
-                ligand = collection['ligands'][ligand_key]
-
-                logging.debug(f"Adding {ligand_key} to tasklist")
-
-                # For each replica
-                for replica_index in range(scenario['replicas']):
-
-                    task = {
-                        'collection_key': collection_key,
-                        'ligand_key': ligand_key,
-                        'ligand_format': ligand_format,
-                        'scenario_key': scenario_key,
-                        'config_path': scenario['config'],
-                        'program': scenario['program'],
-                        'program_long': scenario['program_long'],
-                        'replica_index': replica_index,
-                        'ligand_path': ligand['path'],
-                        'output_path_base': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}'),
-                        'output_path': os.path.join(results_dir, f'{ligand_key}_replica-{replica_index}.{ligand_format}'),
-                        'log_path': os.path.join(log_dir, f'{ligand_key}_replica-{replica_index}'),
-                        'input_files_dir':  os.path.join(ctx['temp_dir'], "vf_input", "input-files"),
-                        'timeout': int(ctx['main_config']['program_timeout']),
-                        'tools_path': ctx['tools_path'],
-                        'threads_per_docking': int(ctx['main_config']['threads_per_docking']),
-                        'get_smi': get_smi
-                    }
-
-                    tasklist.append(task)
-
-    # At this point we have all of the individual tasks generated. The next step is to divide these up to
-    # multiple processes in a pool. Each task will run independently and generate results
-
-    logging.info(f"Starting processing ligands with {ctx['vcpus_to_use']} vcpus")
-
-    with multiprocessing.Pool(processes=ctx['vcpus_to_use']) as pool:
-        res = pool.map(process_ligand, tasklist)
-
-    # We are done with all of the docking now, we need to summarize them all
-
-    # For each task get the data collected
-
-    for task_result in res:
-        collection_key = task_result['collection_key']
-        scenario_key = task_result['scenario_key']
-        ligand_key = task_result['ligand_key']
-        replica_index = task_result['replica_index']
-
-        collection = collections[collection_key]
-
-        # Check to see if it was successful or not...
-        if(task_result['status'] == "success"):
-            score = task_result['score']
-            scenario_results[scenario_key][collection_key]['ligands'][ligand_key]['scores'].append(
-                score)
-            collection['log'].append(
-                f"{ligand_key} {scenario_key} {replica_index} succeeded total-time:{task_result['seconds']:.2f}")
-            collection['log_json'].append({
-                'ligand': ligand_key, 'scenario_key': scenario_key, 'replica_index': replica_index,
-                'status': 'succeeded', 'seconds': f"{task_result['seconds']:.2f}", 'score': score
-            })
-            if 'smi' in task_result:
-                scenario_results[scenario_key][collection_key]['ligands'][ligand_key]['smi'] = task_result['smi']
-        else:
-            collection['log'].append(
-                f"{ligand_key} {scenario_key} {replica_index} {task_result['status']} total-time:{task_result['seconds']:.2f}")
-            collection['log_json'].append({'ligand': ligand_key, 'scenario_key': scenario_key, 'replica_index': replica_index,
-                                          'status': task_result['status'], 'seconds': f"{task_result['seconds']:.2f}"})
-
-    # Now we can generate the summary files
-    for scenario_key in ctx['main_config']['docking_scenarios']:
-        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
-        for collection_key in collections:
-            collection = collections[collection_key]
-            scenario_result = scenario_results[scenario_key][collection_key]
-
-            for summary_format in ctx['main_config']['summary_formats']:
-                output_name = create_summary_file(
-                    ctx, scenario, collection, scenario_result, output_format=summary_format, get_smi=get_smi)
-
-    # Generate the compressed files
-
-    for scenario_key in ctx['main_config']['docking_scenarios']:
-        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
-        for collection_key in collections:
-            collection = collections[collection_key]
-
-            # Generate the tarfile of all results
-            tarpath = generate_tarfile(ctx, scenario_collection_output_directory(
-                ctx, scenario, collection, "results", tmp_prefix=1))
-
-            # Generate the tarfile of all logs
-            tarpath = generate_tarfile(ctx, scenario_collection_output_directory(
-                ctx, scenario, collection, "logfiles", tmp_prefix=1))
-
-            # Summaries are already gzipped when written
-
-    # Now we need to move these data files -- S3 or elsewhere on the filesystem
-
-    for scenario_key in ctx['main_config']['docking_scenarios']:
-        scenario = ctx['main_config']['docking_scenarios'][scenario_key]
-        for collection_key in collections:
-            collection = collections[collection_key]
-
-            logging.info(f"Completed scenario: {scenario_key}, collection: {collection_key}")
-
-            # Copy the results..
-            copy_output(ctx,
-                        {
-                            'src': scenario_collection_output_directory_tgz(ctx, scenario, collection, 'results', tmp_prefix=1),
-                            'dest_path': scenario_collection_output_directory_tgz_hash(ctx, scenario, collection, 'results', tmp_prefix=0),
-                        }
-                        )
-
-            copy_output(ctx,
-                        {
-                            'src': scenario_collection_output_directory_tgz(ctx, scenario, collection, 'logfiles', tmp_prefix=1),
-                            'dest_path': scenario_collection_output_directory_tgz_hash(ctx, scenario, collection, 'logfiles', tmp_prefix=0),
-                        }
-                        )
-
-            for summary_format in ctx['main_config']['summary_formats']:
-                copy_output(ctx,
-                            {
-                                'src': scenario_collection_output_directory_txt_gz(ctx, scenario, collection, 'summaries', tmp_prefix=1, summary_format=summary_format),
-                                'dest_path': scenario_collection_output_directory_txt_gz_hash(ctx, scenario, collection, 'summaries', tmp_prefix=0, summary_format=summary_format),
-                            }
-                            )
-
-    # We also have one file at the collection level
-    for collection_key in collections:
-        collection = collections[collection_key]
-
-        ligand_log_dir = collection_output_directory(
-            ctx, collection, "ligand-lists", tmp_prefix=1, skip_num=1)
-        ligand_log_file = collection_output_directory_status_gz(
-            ctx, collection, "ligand-lists", tmp_prefix=1)
-        ligand_log_file_json = collection_output_directory_status_json_gz(
-            ctx, collection, "ligand-lists", tmp_prefix=1)
-
-        os.makedirs(ligand_log_dir, exist_ok=True)
-        os.chdir(ligand_log_dir)
-
-        with gzip.open(ligand_log_file, "wt") as summmary_fp:
-            for log_entry in collection['log']:
-                summmary_fp.write(f"{log_entry}\n")
-
-        # Now transfer over txt file
-        copy_output(ctx,
-                    {
-                        'src': ligand_log_file,
-                        'dest_path': collection_output_directory_status_gz_hash(ctx, collection, "ligand-lists", tmp_prefix=0),
-                    }
-                    )
-
-        with gzip.open(ligand_log_file_json, "wt") as summmary_fp:
-            json.dump(collection['log_json'], summmary_fp, indent=4)
-
-        # Now transfer over JSON file
-        copy_output(ctx,
-                    {
-                        'src': ligand_log_file_json,
-                        'dest_path': collection_output_directory_status_json_gz_hash(ctx, collection, "ligand-lists", tmp_prefix=0),
-                    }
-                    )
-
-
-def copy_output(ctx, obj):
-
-
-    if(ctx['job_storage_mode'] == "s3"):
-        if(ctx['main_config']['object_store_job_addressing_mode'] == "hash"):
-            object_name = f"{ctx['main_config']['object_store_job_prefix']}/{obj['dest_path']}"
-        else:
-            object_name = f"{ctx['main_config']['object_store_job_prefix_full']}/{obj['dest_path']}"
-
-        try:
-            response = ctx['s3'].upload_file(
-                obj['src'], ctx['main_config']['object_store_job_bucket'], object_name)
-        except botocore.exceptions.ClientError as e:
-            logging.error(e)
-
-            # We want to fail if this happens...
-            raise(e)
-            return False
-
-        logging.info(f"Copied output to '{object_name}'' in bucket '{ctx['main_config']['object_store_job_bucket']}'")
-
-    elif(ctx['job_storage_mode'] == "sharedfs"):
-
-        copy_to_location = f"{ctx['main_config']['sharedfs_workflow_path']}/{obj['dest_path']}"
-
-        parent_directory = Path(Path(copy_to_location).parent)
-        parent_directory.mkdir(parents=True, exist_ok=True)
-
-        shutil.copyfile(obj['src'], copy_to_location)
-
-        logging.info(f"Copied output to '{copy_to_location}'")
-    else:
-        logging.error("invalid job storage mode")
-
-
-
-    return True
-
-
-def generate_tarfile(ctx, dir):
-    os.chdir(str(Path(dir).parents[0]))
-
-    with tarfile.open(f"{os.path.basename(dir)}.tar.gz", "x:gz") as tar:
-        tar.add(os.path.basename(dir))
-
-    return os.path.join(str(Path(dir).parents[0]), f"{os.path.basename(dir)}.tar.gz")
 
 
 def main():

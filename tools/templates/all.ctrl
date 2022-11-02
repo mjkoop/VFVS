@@ -240,3 +240,19 @@ docking_scenario_inputfolders=qvina02_rigid_receptor1
 # If other input files are required by the docking type, usually
 #     specified in the config.txt file, they have to be in the same folder
 
+sensor_screen_mode=1
+# Run a subset of the ligands included in the library. Only functional
+# if library supports the sensor screen functionality with .listing
+# file inside the collection
+#
+# Supported values:
+#   0 : Turned off, run all ligands within each collection
+#   1 : Turned on, run only `sensor_screen_count` number of ligands per
+#       individual collection
+
+
+sensor_screen_count=1
+# Number of ligands from a given collection/tranche that should
+# be screened from a sensor screen enabled collection (with .listing file)
+#
+# Only used if sensor_screen_mode=1

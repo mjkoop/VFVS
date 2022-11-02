@@ -213,6 +213,15 @@ def check_parameters(config):
 
     config['object_store_job_prefix_full'] = f"{config['object_store_job_prefix']}/{config['job_letter']}"
 
+    if(empty_value(config, 'sensor_screen_mode')):
+        config['sensor_screen_mode'] = 0
+        config['sensor_screen_count'] = 0
+    elif(int(config['sensor_screen_mode']) == 1):
+        if(empty_value(config, 'sensor_screen_count')):
+            print("* If 'sensor_screen_mode=1' then 'sensor_screen_count' must be set in all.ctrl")
+    else:
+        config['sensor_screen_count'] = 0
+
     return error
 
 
