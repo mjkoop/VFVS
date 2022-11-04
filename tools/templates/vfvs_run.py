@@ -526,8 +526,14 @@ def summary_process(ctx, summary_queue, upload_queue):
 
 def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
 
+    csv_ordering = ['ligand', 'smi', 'collection_key', 'scenario', 'score_average']
+    max_scores = 0
+
     # Need to run all of the averages
     for summary_key, summary_value in summary_data.items():
+
+        if(len(summary_value['scores']) > max_scores):
+            max_scores = len(summary_value['scores'])
 
         for index, score in enumerate(summary_value['scores']):
             summary_value[f"score_{index}"] = score
@@ -535,22 +541,53 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
         summary_value['score_average'] = mean(summary_value['scores'])
         summary_value.pop('scores', None)
 
-    # Now we can generate a parquet file with all of the data
-    df = pd.DataFrame.from_dict(summary_data, "index")
+
+    if 'parquet' in ctx['main_config']['summary_formats']:
+
+        # Now we can generate a parquet file with all of the data
+        df = pd.DataFrame.from_dict(summary_data, "index")
+
+        upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+
+        uploader_item = {
+            'storage_type': ctx['main_config']['job_storage_mode'],
+            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
+            's3_bucket': ctx['main_config']['object_store_job_bucket'],
+            'local_path': f"{upload_tmp_dir}/summary.parquet",
+            'temp_dir': upload_tmp_dir
+        }
+
+        df.to_parquet(uploader_item['local_path'], compression='gzip')
+        upload_queue.put(uploader_item)
+
+    if 'csv.gz' in ctx['main_config']['summary_formats']:
+
+        for index in range(max_scores):
+            csv_ordering.append(f"score_{index}")
+
+        upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+
+        with gzip.open(f"{upload_tmp_dir}/summary.txt.gz", "wt") as summmary_fp:
+
+            # print header
+            summmary_fp.write(",".join(csv_ordering))
+            summmary_fp.write("\n")
+
+            for summary_key, summary_value in summary_data.items():
+
+                ordered_summary_list = list(map(lambda key: str(summary_value[key]), csv_ordering))
+                summmary_fp.write(",".join(ordered_summary_list))
+                summmary_fp.write("\n")
 
 
-    upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
-
-    uploader_item = {
-        'storage_type': ctx['main_config']['job_storage_mode'],
-        'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
-        's3_bucket': ctx['main_config']['object_store_job_bucket'],
-        'local_path': f"{upload_tmp_dir}/summary.parquet",
-        'temp_dir': upload_tmp_dir
-    }
-
-    df.to_parquet(uploader_item['local_path'], compression='gzip')
-    upload_queue.put(uploader_item)
+        uploader_item_csv = {
+            'storage_type': ctx['main_config']['job_storage_mode'],
+            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/csv/{ctx['workunit_id']}/{ctx['subjob_id']}.csv.gz",
+            's3_bucket': ctx['main_config']['object_store_job_bucket'],
+            'local_path': f"{upload_tmp_dir}/summary.txt.gz",
+            'temp_dir': upload_tmp_dir
+        }
+        upload_queue.put(uploader_item_csv)
 
 
 
@@ -622,7 +659,9 @@ def process_config(ctx):
 
 
     if('summary_formats' not in ctx['main_config']):
-        ctx['main_config']['txt.gz']
+        ctx['main_config']['summary_formats'] = {
+                'csv.gz': 1
+        }
 
     for index, scenario in enumerate(ctx['main_config']['docking_scenario_names']):
 
