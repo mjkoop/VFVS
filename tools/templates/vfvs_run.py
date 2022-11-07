@@ -159,6 +159,7 @@ def unpack_item(item, sensor_screen_mode, sensor_screen_count):
 
                 ligands[ligand_name] = {
                     'path':  os.path.join(item['temp_dir'], item['collection']['collection_number'], ligand),
+                    'base_collection_key': item['collection_key'],
                     'collection_key': item['collection_key']
                 }
 
@@ -219,6 +220,11 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                 completions_per_ligand += 1
 
 
+            # generate directory for output
+            scenario_directory = Path(item['temp_dir']) / "output" / scenario_key
+            scenario_directory.mkdir(parents=True, exist_ok=True)
+
+
         # Process every ligand after making sure it is valid
 
         for ligand_key in item['ligands']:
@@ -256,8 +262,8 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
             if(skip_ligand == 0):
 
                 # We can submit this for processing
-                smi = get_smi(ctx['main_config']['ligand_library_format'], ligand['path'])
-                submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], smi, item['temp_dir'])
+                ligand_attrs = get_attrs(ctx['main_config']['ligand_library_format'], ligand['path'], ctx['main_config']['print_attrs_in_summary'])
+                submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], ligand['base_collection_key'], ligand_attrs, item['temp_dir'])
                 expected_ligands += completions_per_ligand
 
             else:
@@ -272,7 +278,7 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
         summary_item = {
             'type': "delete",
             'temp_dir': item['temp_dir'],
-            'collection_key': item['collection_key'],
+            'base_collection_key': item['collection_key'],
             'expected_completions': expected_ligands
         }
 
@@ -281,25 +287,42 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
 
 
 
-def get_smi(ligand_format, ligand_path):
+def get_attrs(ligand_format, ligand_path, attrs = ['smi']):
 
-    valid_formats = ['pdbqt', 'mol2']
+    valid_formats = ['pdbqt', 'mol2', 'pdb', 'sdf']
+
+    attributes = {}
+    attributes_found = 0
+    for key in attrs:
+        attributes[key] = "N/A"
 
     if ligand_format in valid_formats:
         with open(ligand_path, "r") as read_file:
             for line in read_file:
                 line = line.strip()
-                match = re.search(r"SMILES:\s*(?P<smi>.*)$", line)
-                if(match):
-                    return match.group('smi')
+
                 match = re.search(r"SMILES_current:\s*(?P<smi>.*)$", line)
                 if(match):
-                    return match.group('smi')
+                    attributes['smi'] = match.group('smi')
+                    attributes_found += 1
 
-    return "N/A"
+                match = re.search(r"SMILES:\s*(?P<smi>.*)$", line)
+                if(match):
+                    attributes['smi'] = match.group('smi')
+                    attributes_found += 1
+
+                match = re.search(r"\* Heavy atom count:\s*(?P<hacount>.*)$", line)
+                if(match):
+                    attributes['heavy_atom_count'] = match.group('hacount')
+                    attributes_found += 1
+
+                if(attributes_found >= len(attrs)):
+                    break
+
+    return attributes
 
 
-def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, collection_key, smi, temp_dir):
+def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, collection_key, base_collection_key, ligand_attrs, temp_dir):
 
     for scenario_key in ctx['main_config']['docking_scenarios']:
         scenario = ctx['main_config']['docking_scenarios'][scenario_key]
@@ -309,7 +332,7 @@ def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, coll
                 'ligand_path': ligand_path,
                 'scenario_key': scenario_key,
                 'collection_key': collection_key,
-                'smi': smi,
+                'base_collection_key': base_collection_key,
                 'config_path': scenario['config'],
                 'program': scenario['program'],
                 'program_long': scenario['program_long'],
@@ -317,14 +340,14 @@ def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, coll
                 'timeout': int(ctx['main_config']['program_timeout']),
                 'tools_path': ctx['tools_path'],
                 'threads_per_docking': int(ctx['main_config']['threads_per_docking']),
-                'temp_dir': temp_dir
+                'temp_dir': temp_dir,
+                'attrs': ligand_attrs
             }
 
         docking_queue.put(docking_item)
 
     while docking_queue.qsize() > 100:
             time.sleep(0.2)
-
 
 def docking_process(docking_queue, summary_queue):
 
@@ -341,26 +364,25 @@ def docking_process(docking_queue, summary_queue):
 
         print(f"processing {item['ligand_key']}")
 
-        item['output_path'] = f"{item['temp_dir']}/{item['ligand_key']}.output"
-        item['ligand_path.old'] = item['ligand_path']
-        item['ligand_path'] = f"{item['temp_dir']}/{item['ligand_key']}.pdbqt"
+        scenario_output_directory = Path(item['temp_dir']) / "output" / item['scenario_key']
 
-        # COMPND -- seems to be invalid?
-        with open(item['ligand_path'], "w") as write_file:
-            with open(item['ligand_path.old'], "r") as read_file:
-                for line in read_file:
-                    if(re.search(r"TITLE|SOURCE|KEYWDS|EXPDTA|COMPND|HEADER|AUTHOR", line)):
-                        continue
-                    write_file.write(line)
 
+        item['output_path'] = f"{scenario_output_directory}/{item['ligand_key']}.output"
+        item['log_path'] = f"{scenario_output_directory}/{item['ligand_key']}.log"
+
+        logging.error(f"log path is {item['log_path']}")
+
+        item['ligand_path'] = item['ligand_path']
+        item['status'] = "success"
 
         start_time = time.perf_counter()
+        ret = None
 
-        # x
         try:
             cmd = program_runstring_array(item)
         except RuntimeError as err:
             logging.error(f"Invalid cmd generation for {item['ligand_key']} (program: '{item['program']}')")
+            item['status'] = "fail"
             raise(err)
 
         try:
@@ -368,57 +390,64 @@ def docking_process(docking_queue, summary_queue):
                          text=True, cwd=item['input_files_dir'], timeout=item['timeout'])
         except subprocess.TimeoutExpired as err:
             logging.error(f"timeout on {item['ligand_key']}")
+            item['status'] = "fail"
 
-        if ret.returncode == 0:
 
-            if(item['program'] == "qvina02"
-                    or item['program'] == "qvina_w"
-                    or item['program'] == "vina"
-                    or item['program'] == "vina_carb"
-                    or item['program'] == "vina_xb"
-                    or item['program'] == "gwovina"
-               ):
+        if ret != None:
+            if ret.returncode == 0:
+                if(item['program'] == "qvina02"
+                        or item['program'] == "qvina_w"
+                        or item['program'] == "vina"
+                        or item['program'] == "vina_carb"
+                        or item['program'] == "vina_xb"
+                        or item['program'] == "gwovina"
+                   ):
 
-                match = re.search(
-                    r'^\s+1\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE)
-                if(match):
-                    matches = match.groupdict()
-                    item['score'] = float(matches['value'])
-                    item['status'] = "success"
-                else:
-                    logging.error(
-                        f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
-
-            elif(task['program'] == "smina"):
-                found = 0
-                for line in reversed(ret.stdout.splitlines()):
-                    match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
+                    match = re.search(
+                        r'^\s+1\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE)
                     if(match):
                         matches = match.groupdict()
                         item['score'] = float(matches['value'])
-                        item['status'] = "success"
-                        found = 1
-                        break
-                if(found == 0):
+
+                    else:
+                        logging.error(
+                            f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                        item['status'] = "fail"
+
+                elif(task['program'] == "smina"):
+                    found = 0
+                    for line in reversed(ret.stdout.splitlines()):
+                        match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
+                        if(match):
+                            matches = match.groupdict()
+                            item['score'] = float(matches['value'])
+                            found = 1
+                            break
+                    if(found == 0):
+                        logging.error(
+                            f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                        item['status'] = "fail"
+
+                elif(task['program'] == "adfr"):
                     logging.error(
-                        f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                        f"adfr not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                    item['status'] = "fail"
+                elif(task['program'] == "plants"):
+                    logging.error(
+                        f"plants not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                    item['status'] = "fail"
 
-            elif(task['program'] == "adfr"):
+            else:
                 logging.error(
-                    f"adfr not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
-            elif(task['program'] == "plants"):
-                logging.error(
-                    f"plants not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                    f"Non zero return code for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
+                item['status'] = "fail"
 
-        else:
-            logging.error(
-                f"Non zero return code for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
-            logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
+            # Place output into files
+            with open(item['log_path'], "w") as output_f:
+                output_f.write(f"STDOUT:\n{ret.stdout}\n")
+                output_f.write(f"STDERR:\n{ret.stderr}\n")
 
-        # Place output into files
-        #with open(task['log_path'], "w") as output_f:
-        #    output_f.write(f"STDOUT:\n{ret.stdout}\n")
-        #    output_f.write(f"STDERR:\n{ret.stderr}\n")
 
         end_time = time.perf_counter()
 
@@ -428,19 +457,26 @@ def docking_process(docking_queue, summary_queue):
         while summary_queue.qsize() > 200:
             time.sleep(0.2)
 
-
         item['type'] = "docking_complete"
         summary_queue.put(item)
 
 
 
-def check_for_completion_of_collection_key(collection_completions, collection_key):
+def check_for_completion_of_collection_key(collection_completions, collection_key, scenario_directories):
+
+    print(f"in check_for_completion_of_collection_key... {collection_key}")
     current_completions = collection_completions[collection_key]['current_completions']
     expected_completions = collection_completions[collection_key]['expected_completions']
 
     if current_completions == expected_completions:
+        for scenario_key, scenario_dest in scenario_directories.items():
+            scenario_directory = Path(collection_completions[collection_key]['temp_dir']) / "output" / scenario_key
+            for dir_file in scenario_directory.iterdir():
+                shutil.move(str(dir_file), f"{scenario_dest}/")
+
         shutil.rmtree(collection_completions[collection_key]['temp_dir'])
         collection_completions.pop(collection_key, None)
+
 
 
 
@@ -448,10 +484,17 @@ def summary_process(ctx, summary_queue, upload_queue):
 
     print("starting summary process")
 
-    dockings_processed = 0
     summary_data = {}
-
+    dockings_processed = 0
     collection_completions = {}
+    scenario_directory = {}
+
+    for scenario_key in ctx['main_config']['docking_scenarios']:
+        summary_data[scenario_key] = {}
+
+        scenario_directory[scenario_key] = Path(ctx['temp_dir']) / "output" / scenario_key / ctx['subjob_id']
+        scenario_directory[scenario_key].mkdir(parents=True, exist_ok=True)
+
 
     while True:
         try:
@@ -465,129 +508,175 @@ def summary_process(ctx, summary_queue, upload_queue):
             # clean up anything extra that is around
             if(dockings_processed > 0):
                 generate_summary_file(ctx, summary_data, upload_queue, ctx['temp_dir'])
-
+                generate_output_archives(ctx, upload_queue, scenario_directory)
             break
 
 
         if(item['type'] == "delete"):
-            if item['collection_key'] in collection_completions:
-                collection_completions[item['collection_key']]['expected_completions'] = item['expected_completions']
-                collection_completions[item['collection_key']]['temp_dir'] = item['temp_dir']
+            if item['base_collection_key'] in collection_completions:
+                collection_completions[item['base_collection_key']]['expected_completions'] = item['expected_completions']
+                collection_completions[item['base_collection_key']]['temp_dir'] = item['temp_dir']
             else:
-                collection_completions[item['collection_key']] = {
+                collection_completions[item['base_collection_key']] = {
                     'expected_completions':item['expected_completions'],
                     'current_completions': 0,
                     'temp_dir': item['temp_dir']
                 }
 
-            check_for_completion_of_collection_key(collection_completions, item['collection_key'])
+            check_for_completion_of_collection_key(collection_completions, item['base_collection_key'], scenario_directory)
 
         elif(item['type'] == "docking_complete"):
             # Save off the data we need
-
-            summary_key = f"({item['ligand_key']})({item['scenario_key']})"
-            log_index = int(dockings_processed / 1000)
-
-            if summary_key not in summary_data:
-                summary_data[summary_key] = {
-                    'ligand': item['ligand_key'],
-                    'smi': item['smi'],
-                    'collection_key': item['collection_key'],
-                    'scenario': item['scenario_key'],
-                    'scores': [ item['score'] ]
-                }
-            else:
-                summary_data[summary_key]['scores'].append(item['score'])
-
-
             dockings_processed += 1
 
+            if(item['status'] == "success"):
+
+                summary_key = f"{item['ligand_key']}"
+
+                if summary_key not in summary_data[item['scenario_key']]:
+                    summary_data[item['scenario_key']][summary_key] = {
+                        'ligand': item['ligand_key'],
+                        'collection_key': item['collection_key'],
+                        'scenario': item['scenario_key'],
+                        'scores': [ item['score'] ],
+                        'attrs': item['attrs']
+                    }
+
+                else:
+                    summary_data[item['scenario_key']][summary_key]['scores'].append(item['score'])
 
             # See if this was the last completion for this collection_key
 
-            if item['collection_key'] in collection_completions:
-                collection_completions[item['collection_key']]['current_completions'] += 1
-                check_for_completion_of_collection_key(collection_completions, item['collection_key'])
+            if item['base_collection_key'] in collection_completions:
+                collection_completions[item['base_collection_key']]['current_completions'] += 1
+                check_for_completion_of_collection_key(collection_completions, item['base_collection_key'], scenario_directory)
             else:
-                collection_completions[item['collection_key']] = {
+                collection_completions[item['base_collection_key']] = {
                     'expected_completions': -1,
                     'current_completions': 1,
                     'temp_dir': ""
                 }
-
-
         else:
             logging.error(f"received invalid summary completion {item['type']}")
             raise
 
+
+def generate_tarfile(dir, tarname):
+    os.chdir(str(Path(dir).parents[0]))
+
+    with tarfile.open(tarname, "x:gz") as tar:
+        tar.add(os.path.basename(dir))
+
+    return os.path.join(str(Path(dir).parents[0]), tarname)
+
+
+def generate_output_archives(ctx, upload_queue, scenario_directories):
+
+    for scenario_key, scenario_dir in scenario_directories.items():
+
+        upload_tmp_dir = tempfile.mkdtemp(prefix=ctx['temp_dir'])
+
+        # tar the file
+        tar_name = f"{upload_tmp_dir}/{ctx['subjob_id']}.tar.gz"
+        tar_gz_path = generate_tarfile(scenario_dir, tar_name)
+
+        uploader_item = {
+            'storage_type': ctx['main_config']['job_storage_mode'],
+            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/logs/{ctx['workunit_id']}/{ctx['subjob_id']}.tar.gz",
+            's3_bucket': ctx['main_config']['object_store_job_bucket'],
+            'local_path': tar_name,
+            'temp_dir': upload_tmp_dir
+        }
+
+        upload_queue.put(uploader_item)
 
 
 
 
 def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
 
-    csv_ordering = ['ligand', 'smi', 'collection_key', 'scenario', 'score_average']
-    max_scores = 0
+    for scenario_key in ctx['main_config']['docking_scenarios']:
 
-    # Need to run all of the averages
-    for summary_key, summary_value in summary_data.items():
+        if(len(summary_data[scenario_key]) == 0):
+            break
 
-        if(len(summary_value['scores']) > max_scores):
-            max_scores = len(summary_value['scores'])
+        csv_ordering = ['ligand', 'collection_key', 'scenario', 'score_average', 'score_min']
+        max_scores = 0
 
-        for index, score in enumerate(summary_value['scores']):
-            summary_value[f"score_{index}"] = score
+        # Need to run all of the averages
+        for summary_key, summary_value in summary_data[scenario_key].items():
 
-        summary_value['score_average'] = mean(summary_value['scores'])
-        summary_value.pop('scores', None)
+            if(len(summary_value['scores']) > max_scores):
+                max_scores = len(summary_value['scores'])
+
+            for index, score in enumerate(summary_value['scores']):
+                summary_value[f"score_{index}"] = score
+
+            summary_value['score_average'] = mean(summary_value['scores'])
+            summary_value['score_min'] = min(summary_value['scores'])
+
+            summary_value.pop('scores', None)
+
+            # Update the attrs
+            for attr_name, attr_value in summary_value['attrs'].items():
+                summary_value[f'attr_{attr_name}'] = attr_value
+                if f'attr_{attr_name}' not in csv_ordering:
+                    csv_ordering.append(f'attr_{attr_name}')
+
+            summary_value.pop('attrs', None)
 
 
-    if 'parquet' in ctx['main_config']['summary_formats']:
 
-        # Now we can generate a parquet file with all of the data
-        df = pd.DataFrame.from_dict(summary_data, "index")
+        csv_ordering.extend(['score_average', 'score_min'])
 
-        upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+        # Ouput for each scenario
 
-        uploader_item = {
-            'storage_type': ctx['main_config']['job_storage_mode'],
-            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
-            's3_bucket': ctx['main_config']['object_store_job_bucket'],
-            'local_path': f"{upload_tmp_dir}/summary.parquet",
-            'temp_dir': upload_tmp_dir
-        }
+        if 'parquet' in ctx['main_config']['summary_formats']:
 
-        df.to_parquet(uploader_item['local_path'], compression='gzip')
-        upload_queue.put(uploader_item)
+            # Now we can generate a parquet file with all of the data
+            df = pd.DataFrame.from_dict(summary_data[scenario_key], "index")
 
-    if 'csv.gz' in ctx['main_config']['summary_formats']:
+            upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
 
-        for index in range(max_scores):
-            csv_ordering.append(f"score_{index}")
+            uploader_item = {
+                'storage_type': ctx['main_config']['job_storage_mode'],
+                'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
+                's3_bucket': ctx['main_config']['object_store_job_bucket'],
+                'local_path': f"{upload_tmp_dir}/summary.parquet",
+                'temp_dir': upload_tmp_dir
+            }
 
-        upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+            df.to_parquet(uploader_item['local_path'], compression='gzip')
+            upload_queue.put(uploader_item)
 
-        with gzip.open(f"{upload_tmp_dir}/summary.txt.gz", "wt") as summmary_fp:
 
-            # print header
-            summmary_fp.write(",".join(csv_ordering))
-            summmary_fp.write("\n")
+        if 'csv.gz' in ctx['main_config']['summary_formats']:
 
-            for summary_key, summary_value in summary_data.items():
+            for index in range(max_scores):
+                csv_ordering.append(f"score_{index}")
 
-                ordered_summary_list = list(map(lambda key: str(summary_value[key]), csv_ordering))
-                summmary_fp.write(",".join(ordered_summary_list))
+            upload_tmp_dir = tempfile.mkdtemp(prefix=tmp_dir)
+
+            with gzip.open(f"{upload_tmp_dir}/summary.txt.gz", "wt") as summmary_fp:
+
+                # print header
+                summmary_fp.write(",".join(csv_ordering))
                 summmary_fp.write("\n")
 
+                for summary_key, summary_value in summary_data[scenario_key].items():
+                    ordered_summary_list = list(map(lambda key: str(summary_value[key]), csv_ordering))
+                    summmary_fp.write(",".join(ordered_summary_list))
+                    summmary_fp.write("\n")
 
-        uploader_item_csv = {
-            'storage_type': ctx['main_config']['job_storage_mode'],
-            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/csv/{ctx['workunit_id']}/{ctx['subjob_id']}.csv.gz",
-            's3_bucket': ctx['main_config']['object_store_job_bucket'],
-            'local_path': f"{upload_tmp_dir}/summary.txt.gz",
-            'temp_dir': upload_tmp_dir
-        }
-        upload_queue.put(uploader_item_csv)
+
+            uploader_item_csv = {
+                'storage_type': ctx['main_config']['job_storage_mode'],
+                'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/csv/{ctx['workunit_id']}/{ctx['subjob_id']}.csv.gz",
+                's3_bucket': ctx['main_config']['object_store_job_bucket'],
+                'local_path': f"{upload_tmp_dir}/summary.txt.gz",
+                'temp_dir': upload_tmp_dir
+            }
+            upload_queue.put(uploader_item_csv)
 
 
 
@@ -891,13 +980,8 @@ def process(ctx):
 
     ligand_format = ctx['main_config']['ligand_library_format']
 
-    get_smi = 0
-    if('print_smi_in_summary' in ctx['main_config'] and int(ctx['main_config']['print_smi_in_summary']) == 1):
-        get_smi = True
-
 
     # Need to expand out all of the collections in this subjob
-    
     subjob = ctx['subjob_config']
 
 
@@ -973,6 +1057,8 @@ def flush_queue(queue, processes, description):
     logging.error(f"Join {description}")
     for process in processes:
         process.join()
+        if(process.exitcode != 0):
+            raise RuntimeError(f'Process from {description} exited with {process.exitcode}')
     logging.error(f"Finished Join of {description}")
 
 

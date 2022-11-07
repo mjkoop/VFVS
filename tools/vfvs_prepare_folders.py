@@ -61,6 +61,15 @@ def parse_config(filename):
         config['summary_formats'] = config['summary_formats'].split(",")
 
 
+    if('print_attrs_in_summary' in config):
+        config['print_attrs_in_summary'] = config['print_attrs_in_summary'].split(",")
+    elif('print_smi_in_summary' in config and int(config['print_smi_in_summary']) == 1):
+        config['print_attrs_in_summary'] = ['smi']
+    else:
+        config['print_attrs_in_summary'] = []
+
+
+
     return config
 
 
