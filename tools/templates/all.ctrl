@@ -262,3 +262,18 @@ sensor_screen_count=1
 # be screened from a sensor screen enabled collection (with .listing file)
 #
 # Only used if sensor_screen_mode=1
+
+************************************************
+** Query configuration
+************************************************
+
+****** AWS Athena information
+# AWS Athena will allow ranking of ligand output
+# using the vfvs_get_top_results.py script
+
+athena_s3_location=
+# Location of S3 data for where AWS Athena queries should
+# be output
+#
+# Must be in format of s3://bucket_name/prefix
+# e.g. s3://sample-bucket/athena/
