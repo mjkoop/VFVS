@@ -260,7 +260,6 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                         coords[coord_str] = 1
 
             if(skip_ligand == 0):
-
                 # We can submit this for processing
                 ligand_attrs = get_attrs(ctx['main_config']['ligand_library_format'], ligand['path'], ctx['main_config']['print_attrs_in_summary'])
                 submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], ligand['base_collection_key'], ligand_attrs, item['temp_dir'])
@@ -326,7 +325,12 @@ def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, coll
 
     for scenario_key in ctx['main_config']['docking_scenarios']:
         scenario = ctx['main_config']['docking_scenarios'][scenario_key]
+
         for replica_index in range(scenario['replicas']):
+
+            ligand_directory_directory = Path(temp_dir) / "output" / scenario_key / ligand_name / str(replica_index)
+            ligand_directory_directory.mkdir(parents=True, exist_ok=True)
+
             docking_item = {
                 'ligand_key': ligand_name,
                 'ligand_path': ligand_path,
@@ -341,10 +345,11 @@ def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, coll
                 'tools_path': ctx['tools_path'],
                 'threads_per_docking': int(ctx['main_config']['threads_per_docking']),
                 'temp_dir': temp_dir,
-                'attrs': ligand_attrs
+                'attrs': ligand_attrs,
+                'output_dir': str(ligand_directory_directory)
             }
 
-        docking_queue.put(docking_item)
+            docking_queue.put(docking_item)
 
     while docking_queue.qsize() > 100:
             time.sleep(0.2)
@@ -364,13 +369,8 @@ def docking_process(docking_queue, summary_queue):
 
         print(f"processing {item['ligand_key']}")
 
-        scenario_output_directory = Path(item['temp_dir']) / "output" / item['scenario_key']
-
-
-        item['output_path'] = f"{scenario_output_directory}/{item['ligand_key']}.output"
-        item['log_path'] = f"{scenario_output_directory}/{item['ligand_key']}.log"
-
-        logging.error(f"log path is {item['log_path']}")
+        item['output_path'] = f"{item['output_dir']}/output"
+        item['log_path'] = f"{item['output_dir']}/stdout"
 
         item['ligand_path'] = item['ligand_path']
         item['status'] = "success"
@@ -464,7 +464,6 @@ def docking_process(docking_queue, summary_queue):
 
 def check_for_completion_of_collection_key(collection_completions, collection_key, scenario_directories):
 
-    print(f"in check_for_completion_of_collection_key... {collection_key}")
     current_completions = collection_completions[collection_key]['current_completions']
     expected_completions = collection_completions[collection_key]['expected_completions']
 
