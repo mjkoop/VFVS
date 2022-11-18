@@ -74,14 +74,18 @@ def main():
     print("In order to use the query, `parquet` must be a summary_format")
     exit(1)
 
-  if(len(ctx['config']['docking_scenarios']) == 1):
+  if ctx['config']['batchsystem'] != 'awsbatch':
+    print("In order to use this query script, AWS must be configured")
+    exit(1)
+
+  if(len(ctx['config']['docking_scenarios_internal']) == 1):
     scenario_required = False
-    scenario_default = list(ctx['config']['docking_scenarios'].keys())[0]
+    scenario_default = list(ctx['config']['docking_scenarios_internal'].keys())[0]
 
   parser = argparse.ArgumentParser()
 
   parser.add_argument('--scenario-name', action='store', type=str, required=scenario_required, default=scenario_default)
-  parser.add_argument('--top', action='store', type=int, required=True)
+  parser.add_argument('--top', action='store', type=int, required=False)
   args = parser.parse_args()
 
   botoconfig = Config(
@@ -95,18 +99,17 @@ def main():
   args_dict = vars(args)
 
   scenario = args_dict['scenario_name']
-  top_results = args_dict['top']
 
-  if scenario not in ctx['config']['docking_scenarios']:
+  if scenario not in ctx['config']['docking_scenarios_internal']:
     print(f"Scenario '{scenario}'' is not defined as part of this job")
     exit(1)
 
-  table_name = ctx['config']['job_name']
+  table_name = ctx['config']['job_name'].replace("-","_")
   athena_location = ctx['config']['athena_s3_location']
   database_name = f"{ctx['config']['aws_batch_prefix']}_vfvs"
   job_location = f"{ctx['config']['object_store_job_prefix_full']}/{scenario}/parquet"
   object_store_job_bucket = ctx['config']['object_store_job_bucket']
-  scenario_info = ctx['config']['docking_scenarios'][scenario]
+  scenario_info = ctx['config']['docking_scenarios_internal'][scenario]
 
 
   client = boto3.client('athena', config=botoconfig)
@@ -193,8 +196,6 @@ def main():
   tblproperties ("parquet.compression"="GZIP");
   """
 
-  #MSCK REPAIR TABLE vfvs_job_testing;
-
   create_table_response = client.start_query_execution(
       QueryString=create_table,
       QueryExecutionContext={
@@ -211,23 +212,16 @@ def main():
     print(f"failed on create of table ({response['QueryExecution']['Status']['State']})")
     exit(1)
 
-  msck_response = client.start_query_execution(
-      QueryString=f"MSCK REPAIR TABLE {table_name};",
-      QueryExecutionContext={
-          'Database': database_name,
-          'Catalog': 'AwsDataCatalog'
-      },
-      ResultConfiguration={
-          'OutputLocation': f'{athena_location}/tmp'
-      }
-  )
 
-  response = wait_for_athena_completion(client, s3_client, msck_response, desc="sync partition data")
-  if(response['QueryExecution']['Status']['State'] != "SUCCEEDED"):
-    print(f"failed on sync of partition data ({response['QueryExecution']['Status']['State']})")
-    exit(1)
+  if 'top' in args_dict and args_dict['top'] != None:
+    top_string = f"limit {args_dict['top']}"
+  else:
+    top_string = ""
 
-  select_statement = f"SELECT * from {table_name} ORDER BY score_min ASC limit {top_results};"
+  select_statement = f"SELECT * from {table_name} ORDER BY score_min ASC {top_string};"
+  print(f"|{select_statement}|")
+
+
 
   select_response = client.start_query_execution(
       QueryString=select_statement,

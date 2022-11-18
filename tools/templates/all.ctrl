@@ -8,7 +8,7 @@ job_name=testing
 threads_per_docking=1
 # How many threads should be used for each docking program. 
 
-threads_to_use=8
+threads_to_use=16
 # This sets how many processes the main execution loop should be using
 # to process. This is generally 2x the number of vCPUs or hyperthreads
 # available on the system it is being run on
@@ -183,10 +183,33 @@ print_attrs_in_summary=smi,heavy_atom_count
 
 ****** Workflow Options
 
-ligands_todo_per_queue=1000
-# Used as a limit of ligands for the to-do lists. 
+
+collection_list_type=standard
+# This determines the input format for the list of collections that 
+# should be processed as part of the workflow. There are two different
+# available formats:
+#  * standard : This is the format that has been traditionally used
+#       with VirtualFlow. The format is: <collection_key> <number_of_ligands_in_collection>
+#       e.g. AABCDAA_0000 10000
+#  * csv_collection_key_ligand : This format allows selecting a specified subset of ligands
+#       within a collection to be run. The format is:
+#       
+#       collection_name,collection_number,ligand
+#       CADBCCCDCCAACCAAAA,0007276,m_275592____15865294____14140940____14133308_S3_T2
+#       CADBCCCDCCAACCAAAA,0007276,m_275592____15865294____14139142____14132874_S1_T0
+#           
+#       The header line with "collection_name,..." is required for this format.
+#
+
+collection_list_file=templates/todo.all
+# Path to the file that contains the collection data on what should be 
+# processed as part of the workflow
+
+dockings_per_subjob=1000
+# Used as how many dockings should be processed per subjob. In general,
+# a subjob should take about 20 min to an hour for efficiency. 
 # A reasonable number for this is generally 1000. The length of time
-#     to process will depend on the docking scenarios run
+# to process will depend on the docking scenarios run
 
 ligand_library_format=pdbqt
 # Supported values:
@@ -199,13 +222,9 @@ ligand_library_format=pdbqt
 #     pdbqt and the mol2 format are supported.
 
 tempdir_default=/dev/shm
-# The directory which is used for the temporary workflow files which need a normal performance
-# Is normally a local SSD or HDD. A temporary directory will be created underneath this dir
+# The directory which is used for the temporary workflow files. Typically this is 
+# /dev/shm, which is an in-memory filesystem location.
 
-
-tempdir_fast=/dev/shm
-# The directory which is used for the temporary workflow files which need a fast perfomance
-# Should be a a local ram filesystem/ramdisk. A temporary directory will be created underneath this dir
 
 ****** Virtual Screening Options
 
@@ -251,11 +270,12 @@ sensor_screen_mode=1
 # if library supports the sensor screen functionality with .listing
 # file inside the collection
 #
+# This is also only supported when collection_list_type=standard
+#
 # Supported values:
 #   0 : Turned off, run all ligands within each collection
 #   1 : Turned on, run only `sensor_screen_count` number of ligands per
 #       individual collection
-
 
 sensor_screen_count=1
 # Number of ligands from a given collection/tranche that should
@@ -277,3 +297,4 @@ athena_s3_location=
 #
 # Must be in format of s3://bucket_name/prefix
 # e.g. s3://sample-bucket/athena/
+

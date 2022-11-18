@@ -53,6 +53,7 @@ from multiprocessing import Process
 from multiprocessing import Queue
 from queue import Empty
 import math
+import sys
 
 
 # Download
@@ -60,7 +61,7 @@ import math
 # Get the file and move it to a local location
 #
 
-def downloader(download_queue, unpack_queue, tmp_dir):
+def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
 
 
     botoconfig = Config(
@@ -91,7 +92,6 @@ def downloader(download_queue, unpack_queue, tmp_dir):
         # Move the data either from S3 or a shared filesystem
 
         if('s3_download_path' in item['collection']):
-
             remote_path = item['collection']['s3_download_path']
             job_bucket = item['collection']['s3_bucket']
 
@@ -99,11 +99,23 @@ def downloader(download_queue, unpack_queue, tmp_dir):
                 with open(item['local_path'], 'wb') as f:
                     s3.download_fileobj(job_bucket, remote_path, f)
             except botocore.exceptions.ClientError as error:
-                    logging.error(f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}, ({error})")
+                    reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
+                    logging.error(reason)
+
+                    # log this to know we skipped
+                    # put on the logging queue
+                    summary_item = {
+                        'type': "download_failed",
+                        'log': {
+                            'base_collection_key': item['collection_key'],
+                            'reason': reason,
+                            'dockings': item['collection']['dockings']
+                        }
+                    }
+                    summary_queue.put(summary_item)
                     continue
 
         elif('sharedfs_path' in item['collection']):
-
             shutil.copyfile(Path(item['collection']['sharedfs_path']), item['local_path'])
 
 
@@ -117,7 +129,7 @@ def downloader(download_queue, unpack_queue, tmp_dir):
 
 
 
-def untar(unpack_queue, collection_queue, sensor_screen_mode, sensor_screen_count):
+def untar(unpack_queue, collection_queue):
     print('Unpacker: Running', flush=True)
 
     while True:
@@ -131,7 +143,7 @@ def untar(unpack_queue, collection_queue, sensor_screen_mode, sensor_screen_coun
         if item is None:
             break
 
-        item['ligands'] = unpack_item(item, sensor_screen_mode, sensor_screen_count)
+        item['ligands'] = unpack_item(item)
 
         # Next step is to process this
         while collection_queue.qsize() > 35:
@@ -141,7 +153,7 @@ def untar(unpack_queue, collection_queue, sensor_screen_mode, sensor_screen_coun
 
 
 
-def unpack_item(item, sensor_screen_mode, sensor_screen_count):
+def unpack_item(item):
 
     ligands = {}
 
@@ -170,8 +182,8 @@ def unpack_item(item, sensor_screen_mode, sensor_screen_count):
             f"ERR: Cannot open {item['local_path']} type: {str(type(err))}, err: {str(err)}")
         return None
 
-    if(int(sensor_screen_mode) == 1):
-
+    # Check if we have specific instructions
+    if(item['collection']['mode'] == "sensor_screen_mode"):
         sensor_screen_ligands = {}
 
         # We should read the sparse file to know which ligands we actually need to keep
@@ -181,14 +193,18 @@ def unpack_item(item, sensor_screen_mode, sensor_screen_count):
 
                 screen_collection_key, screen_ligand_name, screen_index = line.split(",")
 
-                if(int(screen_index) >= int(sensor_screen_count)):
+                if(int(screen_index) >= item['collection']['sensor_screen_count']):
                     continue
 
                 sensor_screen_ligands[screen_ligand_name] = ligands[screen_ligand_name]
                 sensor_screen_ligands[screen_ligand_name]['collection_key'] = screen_collection_key
 
         return sensor_screen_ligands
-
+    elif(item['collection']['mode'] == "named"):
+        select_ligands = {}
+        for ligand_name in item['collection']['ligands']:
+            select_ligands[ligand_name] = ligands[ligand_name]
+        return select_ligands
     else:
         return ligands
 
@@ -268,7 +284,17 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
             else:
                 # log this to know we skipped
                 # put on the logging queue
-                pass
+                summary_item = {
+                    'type': "skip",
+                    'log': {
+                        'base_collection_key': ligand['base_collection_key'],
+                        'collection_key': ligand['collection_key'],
+                        'ligand_key': ligand_key,
+                        'reason': skip_reason_json
+                    }
+                }
+                summary_queue.put(summary_item)
+
 
         # Let the summary queue know that it can delete the directory after len(ligands)
         # number of ligands have been processed
@@ -375,6 +401,13 @@ def docking_process(docking_queue, summary_queue):
         item['ligand_path'] = item['ligand_path']
         item['status'] = "success"
 
+        item['log'] = {
+                'base_collection_key': item['base_collection_key'],
+                'collection_key': item['collection_key'],
+                'ligand_key': item['ligand_key'],
+                'reason': ""
+        }
+
         start_time = time.perf_counter()
         ret = None
 
@@ -410,8 +443,8 @@ def docking_process(docking_queue, summary_queue):
                         item['score'] = float(matches['value'])
 
                     else:
-                        logging.error(
-                            f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                        item['log']['reason'] = f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}"
+                        logging.error(item['log']['reason'])
                         item['status'] = "fail"
 
                 elif(task['program'] == "smina"):
@@ -424,22 +457,22 @@ def docking_process(docking_queue, summary_queue):
                             found = 1
                             break
                     if(found == 0):
-                        logging.error(
-                            f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                        item['log']['reason'] = f"Could not find score for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}"
+                        logging.error(item['log']['reason'])
                         item['status'] = "fail"
 
                 elif(task['program'] == "adfr"):
-                    logging.error(
-                        f"adfr not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                    item['log']['reason'] = f"adfr not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}"
+                    logging.error(tem['log']['reason'])
                     item['status'] = "fail"
                 elif(task['program'] == "plants"):
-                    logging.error(
-                        f"plants not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                    item['log']['reason'] = f"plants not implemented {item['collection_key']} {item['ligand_key']} {item['scenario_key']}"
+                    logging.error(item['log']['reason'])
                     item['status'] = "fail"
 
             else:
-                logging.error(
-                    f"Non zero return code for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}")
+                item['log']['reason'] = f"Non zero return code for {item['collection_key']} {item['ligand_key']} {item['scenario_key']}"
+                logging.error(item['log']['reason'])
                 logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
                 item['status'] = "fail"
 
@@ -479,9 +512,25 @@ def check_for_completion_of_collection_key(collection_completions, collection_ke
 
 
 
-def summary_process(ctx, summary_queue, upload_queue):
+def summary_process(ctx, summary_queue, upload_queue, metadata):
 
     print("starting summary process")
+    start_time =  time.perf_counter()
+
+    overview_data = {
+        'metadata': metadata,
+        'total_dockings': 0,
+        'dockings_status': {
+            'success': 0,
+            'failed': 0
+        },
+        'skipped_ligands': 0,
+        'skipped_ligand_list': [],
+        'failed_list': [],
+        'failed_downloads': 0,
+        'failed_downloads_log': [],
+        'failed_downloads_dockings': 0
+    }
 
     summary_data = {}
     dockings_processed = 0
@@ -504,6 +553,15 @@ def summary_process(ctx, summary_queue, upload_queue):
 
         # check for stop
         if item is None:
+
+            # Calculate how much time we spent
+            overview_data['sec']  = time.perf_counter() - start_time
+
+            # We need to generate the general overview data
+            # even if we didn't process anything
+
+            generate_overview_file(ctx, overview_data, upload_queue)
+
             # clean up anything extra that is around
             if(dockings_processed > 0):
                 generate_summary_file(ctx, summary_data, upload_queue, ctx['temp_dir'])
@@ -524,7 +582,22 @@ def summary_process(ctx, summary_queue, upload_queue):
 
             check_for_completion_of_collection_key(collection_completions, item['base_collection_key'], scenario_directory)
 
+        elif(item['type'] == "download_failed"):
+            overview_data['failed_downloads_log'].append(item['log'])
+            overview_data['failed_downloads'] += 1
+            overview_data['failed_downloads_dockings'] += item['log']['dockings']
+
+
+        elif(item['type'] == "skip"):
+
+            overview_data['skipped_ligands'] += 1
+            overview_data['skipped_ligand_list'].append(item['log'])
+
         elif(item['type'] == "docking_complete"):
+
+            overview_data['total_dockings'] += 1
+            overview_data['dockings_status'][item['status']] += 1
+
             # Save off the data we need
             dockings_processed += 1
 
@@ -543,6 +616,10 @@ def summary_process(ctx, summary_queue, upload_queue):
 
                 else:
                     summary_data[item['scenario_key']][summary_key]['scores'].append(item['score'])
+            else:
+                # Log the failure
+                overview_data['failed_list'].append(item['log'])
+
 
             # See if this was the last completion for this collection_key
 
@@ -569,6 +646,23 @@ def generate_tarfile(dir, tarname):
     return os.path.join(str(Path(dir).parents[0]), tarname)
 
 
+def generate_output_path(ctx, scenario_key, content_type, extension):
+
+
+    if scenario_key != None:
+        if(ctx['main_config']['job_storage_mode'] == "s3"):
+            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+        else:
+            outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / scenario_key / content_type / str(ctx['workunit_id'])
+            return f"{ctx['main_config']['sharedfs_output_files_path']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+    else:
+        if(ctx['main_config']['job_storage_mode'] == "s3"):
+            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+        else:
+            outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / content_type / str(ctx['workunit_id'])
+            return f"{ctx['main_config']['sharedfs_output_files_path']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+
+
 def generate_output_archives(ctx, upload_queue, scenario_directories):
 
     for scenario_key, scenario_dir in scenario_directories.items():
@@ -581,8 +675,8 @@ def generate_output_archives(ctx, upload_queue, scenario_directories):
 
         uploader_item = {
             'storage_type': ctx['main_config']['job_storage_mode'],
-            'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/logs/{ctx['workunit_id']}/{ctx['subjob_id']}.tar.gz",
-            's3_bucket': ctx['main_config']['object_store_job_bucket'],
+            'remote_path' : generate_output_path(ctx, scenario_key, "logs", "tar.gz"),
+            's3_bucket' : ctx['main_config']['object_store_job_bucket'],
             'local_path': tar_name,
             'temp_dir': upload_tmp_dir
         }
@@ -590,7 +684,23 @@ def generate_output_archives(ctx, upload_queue, scenario_directories):
         upload_queue.put(uploader_item)
 
 
+def generate_overview_file(ctx, overview_data, upload_queue):
 
+    upload_tmp_dir = tempfile.mkdtemp(prefix=ctx['temp_dir'])
+    overview_json_location = f"{upload_tmp_dir}/overview.json.gz"
+
+    with gzip.open(overview_json_location, "wt") as json_out:
+        json.dump(overview_data, json_out)
+
+    uploader_item = {
+        'storage_type': ctx['main_config']['job_storage_mode'],
+        'remote_path' : generate_output_path(ctx, None, "summary", "json.gz"),
+        's3_bucket': ctx['main_config']['object_store_job_bucket'],
+        'local_path': overview_json_location,
+        'temp_dir': upload_tmp_dir
+    }
+
+    upload_queue.put(uploader_item)
 
 def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
 
@@ -625,8 +735,11 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
             summary_value.pop('attrs', None)
 
 
+            # For each collection tranche.. .explode them out
+            collection_name, collection_number = summary_value['collection_key'].split("_")
+            for letter_index, letter in enumerate(collection_name):
+                summary_value[f'tranche_{letter_index}'] = letter
 
-        csv_ordering.extend(['score_average', 'score_min'])
 
         # Ouput for each scenario
 
@@ -639,11 +752,12 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
 
             uploader_item = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
-                'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/parquet/{ctx['workunit_id']}/{ctx['subjob_id']}.parquet",
+                'remote_path' : generate_output_path(ctx, scenario_key, "parquet", "parquet"),
                 's3_bucket': ctx['main_config']['object_store_job_bucket'],
                 'local_path': f"{upload_tmp_dir}/summary.parquet",
                 'temp_dir': upload_tmp_dir
             }
+
 
             df.to_parquet(uploader_item['local_path'], compression='gzip')
             upload_queue.put(uploader_item)
@@ -670,7 +784,7 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
 
             uploader_item_csv = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
-                'remote_path': f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/csv/{ctx['workunit_id']}/{ctx['subjob_id']}.csv.gz",
+                'remote_path' : generate_output_path(ctx, scenario_key, "csv", "csv.gz"),
                 's3_bucket': ctx['main_config']['object_store_job_bucket'],
                 'local_path': f"{upload_tmp_dir}/summary.txt.gz",
                 'temp_dir': upload_tmp_dir
@@ -751,12 +865,12 @@ def process_config(ctx):
                 'csv.gz': 1
         }
 
-    for index, scenario in enumerate(ctx['main_config']['docking_scenario_names']):
 
+    ctx['main_config']['docking_scenarios'] = {}
+
+    for index, scenario in enumerate(ctx['main_config']['docking_scenario_names']):
         program_long = ctx['main_config']['docking_scenario_programs'][index]
         program = program_long
-
-        logging.debug(f"Processing scenario '{scenario}' at index '{index}' with {program}")
 
         # Special handing for smina* and gwovina*
         match = re.search(r'^(?P<program>smina|gwovina)', program_long)
@@ -779,6 +893,7 @@ def process_config(ctx):
         }
 
 
+
 def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, download_dir):
     # Download from S3
 
@@ -790,7 +905,7 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
     except botocore.exceptions.ClientError as error:
         logging.error(
             f"Failed to download from S3 {job_bucket}/{job_object} to {download_to_workunit_file}, ({error})")
-        return None
+        sys.exit(1)
 
     os.chdir(download_dir)
 
@@ -808,14 +923,16 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
             # AWS Batch requires that an array job have at least 2 elements,
             # sometimes we only need 1 though
             if(subjob_id == "1"):
-                exit(0)
+                sys.exit(0)
             else:
+                sys.exit(1)
                 raise RuntimeError(f"There is no subjob ID with ID:{subjob_id}")
 
         tar.close()
     except Exception as err:
         logging.error(
             f"ERR: Cannot open {download_to_workunit_file}. type: {str(type(err))}, err: {str(err)}")
+        sys.exit(1)
         return None
 
 
@@ -969,7 +1086,6 @@ def process(ctx):
 
     process_config(ctx)
 
-
     ctx['workunit_id'] = workunit_id
     ctx['subjob_id'] = subjob_id
 
@@ -983,6 +1099,13 @@ def process(ctx):
     # Need to expand out all of the collections in this subjob
     subjob = ctx['subjob_config']
 
+    metadata = {
+        'workunit_id': workunit_id,
+        'subunit_id': subjob_id,
+        'ligand_library_format': ligand_format,
+        'vcpus_to_use': ctx['vcpus_to_use']
+    }
+
 
     download_queue = Queue()
     unpack_queue = Queue()
@@ -992,61 +1115,77 @@ def process(ctx):
     upload_queue = Queue()
 
 
-    downloader_processes = []
-    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
-        downloader_processes.append(Process(target=downloader, args=(download_queue, unpack_queue, ctx['temp_dir'])))
-        downloader_processes[i].start()
 
-    unpacker_processes = []
-    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
-        unpacker_processes.append(Process(target=untar, args=(unpack_queue, collection_queue, ctx['main_config']['sensor_screen_mode'], ctx['main_config']['sensor_screen_count'])))
-        unpacker_processes[i].start()
+    try:
+        downloader_processes = []
+        for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+            downloader_processes.append(Process(target=downloader, args=(download_queue, unpack_queue, summary_queue, ctx['temp_dir'])))
+            downloader_processes[i].start()
 
-    collection_processes = []
-    for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
-        # collection_process(ctx, collection_queue, docking_queue, summary_queue)
-        collection_processes.append(Process(target=collection_process, args=(ctx, collection_queue, docking_queue, summary_queue)))
-        collection_processes[i].start()
+        unpacker_processes = []
+        for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+            unpacker_processes.append(Process(target=untar, args=(unpack_queue, collection_queue)))
+            unpacker_processes[i].start()
 
-    docking_processes = []
-    for i in range(0, ctx['vcpus_to_use']):
-        # docking_process(docking_queue, summary_queue)
-        docking_processes.append(Process(target=docking_process, args=(docking_queue, summary_queue)))
-        docking_processes[i].start()
+        collection_processes = []
+        for i in range(0, math.ceil(ctx['vcpus_to_use'] / 8.0)):
+            # collection_process(ctx, collection_queue, docking_queue, summary_queue)
+            collection_processes.append(Process(target=collection_process, args=(ctx, collection_queue, docking_queue, summary_queue)))
+            collection_processes[i].start()
 
-    # There should never be more than one summary process
-    summary_processes = []
-    summary_processes.append(Process(target=summary_process, args=(ctx, summary_queue, upload_queue)))
-    summary_processes[0].start()
+        docking_processes = []
+        for i in range(0, ctx['vcpus_to_use']):
+            # docking_process(docking_queue, summary_queue)
+            docking_processes.append(Process(target=docking_process, args=(docking_queue, summary_queue)))
+            docking_processes[i].start()
 
-    uploader_processes = []
-    for i in range(0, 1):
-        # docking_process(docking_queue, summary_queue)
-        uploader_processes.append(Process(target=upload_process, args=(ctx, upload_queue)))
-        uploader_processes[i].start()
+        # There should never be more than one summary process
+        summary_processes = []
+        summary_processes.append(Process(target=summary_process, args=(ctx, summary_queue, upload_queue, metadata)))
+        summary_processes[0].start()
 
-    for collection_key in subjob['collections']:
-        collection = subjob['collections'][collection_key]
-
-        download_item = {
-            'collection_key': collection_key,
-            'collection': subjob['collections'][collection_key],
-            'ext': "tar.gz",
-        }
-
-        download_queue.put(download_item)
-
-        # Don't overflow the queues
-        while download_queue.qsize() > 25:
-            time.sleep(0.2)
+        uploader_processes = []
+        for i in range(0, 2):
+            # docking_process(docking_queue, summary_queue)
+            uploader_processes.append(Process(target=upload_process, args=(ctx, upload_queue)))
+            uploader_processes[i].start()
 
 
-    flush_queue(download_queue, downloader_processes, "download")
-    flush_queue(unpack_queue, unpacker_processes, "unpack")
-    flush_queue(collection_queue, collection_processes, "collection")
-    flush_queue(docking_queue, docking_processes, "docking")
-    flush_queue(summary_queue, summary_processes, "summary")
-    flush_queue(upload_queue, uploader_processes, "upload")
+        for collection_key in subjob['collections']:
+            collection = subjob['collections'][collection_key]
+
+            collection_name, collection_number = collection_key.split("_", maxsplit=1)
+            collection['collection_number'] = collection_number
+            collection['collection_name'] = collection_name
+
+            download_item = {
+                'collection_key': collection_key,
+                'collection': collection,
+                'ext': "tar.gz",
+            }
+
+            download_queue.put(download_item)
+
+            # Don't overflow the queues
+            while download_queue.qsize() > 25:
+                time.sleep(0.2)
+
+
+        flush_queue(download_queue, downloader_processes, "download")
+        flush_queue(unpack_queue, unpacker_processes, "unpack")
+        flush_queue(collection_queue, collection_processes, "collection")
+        flush_queue(docking_queue, docking_processes, "docking")
+        flush_queue(summary_queue, summary_processes, "summary")
+        flush_queue(upload_queue, uploader_processes, "upload")
+
+    except Exception as e:
+        logging.error(f"Received exception {e}, terminating")
+
+        for process in [*downloader_processes, *unpacker_processes, *collection_processes, *docking_processes, *summary_processes, *uploader_processes]:
+            print(process.name)
+            process.kill()
+        sys.exit(1)
+
 
 
 def flush_queue(queue, processes, description):
