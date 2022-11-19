@@ -253,7 +253,7 @@ def process(config):
 
                     last_attempt_index = len(job['attempts']) - 1
                     for attempt_index, attempt in enumerate(job['attempts']):
-                        if ( 'stoppedAt' in attempt and 'startedAt' in atttempt):
+                        if ( 'stoppedAt' in attempt and 'startedAt' in attempt):
                             vcpu_time = (attempt['stoppedAt'] - attempt['startedAt']) / 1000 * vcpus_per_job
 
                             if(attempt_index == last_attempt_index):
