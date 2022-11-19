@@ -50,7 +50,7 @@ aws_ecr_repository_name=vf-vfvs-ecr
 # repository (e.g. vf-vfvs-ecr) in your AWS account
 # (If you used the template it is generally vf-vfvs-ecr)
 
-aws_region=us-east-1
+aws_region=us-east-2
 # Set to the AWS location code where you are running AWS Batch
 # (e.g. us-east-1 for North America, Northern Virginia)
 
@@ -282,6 +282,9 @@ sensor_screen_count=1
 # be screened from a sensor screen enabled collection (with .listing file)
 #
 # Only used if sensor_screen_mode=1
+
+run_atom_check=1
+# Remove ligands when certain atoms B, Si, Sn are found
 
 ************************************************
 ** Query configuration
