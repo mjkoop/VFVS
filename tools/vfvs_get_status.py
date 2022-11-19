@@ -249,14 +249,17 @@ def process(config):
                         subjobs_to_parse.append({ 'workunit_id': workunit_id, 'subjob_id': subjob_id})
 
                     subjob['vcpu_seconds_interrupted'] = 0
+                    subjob['vcpu_seconds'] = 0
 
                     last_attempt_index = len(job['attempts']) - 1
                     for attempt_index, attempt in enumerate(job['attempts']):
-                        vcpu_time = (attempt['stoppedAt'] - attempt['startedAt']) / 1000 * vcpus_per_job
-                        if(attempt_index == last_attempt_index):
-                            subjob['vcpu_seconds'] = vcpu_time
-                        else:
-                            subjob['vcpu_seconds_interrupted'] += vcpu_time
+                        if ( 'stoppedAt' in attempt and 'startedAt' in atttempt):
+                            vcpu_time = (attempt['stoppedAt'] - attempt['startedAt']) / 1000 * vcpus_per_job
+
+                            if(attempt_index == last_attempt_index):
+                                subjob['vcpu_seconds'] = vcpu_time
+                            else:
+                                subjob['vcpu_seconds_interrupted'] += vcpu_time
 
                     complete['summary']['vcpu_seconds'] += subjob['vcpu_seconds']
                     complete['summary']['vcpu_seconds_interrupted'] += subjob['vcpu_seconds_interrupted']
