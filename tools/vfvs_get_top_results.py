@@ -78,6 +78,8 @@ def main():
     print("In order to use this query script, AWS must be configured")
     exit(1)
 
+  scenario_required = True
+
   if(len(ctx['config']['docking_scenarios_internal']) == 1):
     scenario_required = False
     scenario_default = list(ctx['config']['docking_scenarios_internal'].keys())[0]
