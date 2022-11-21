@@ -79,14 +79,19 @@ def main():
     exit(1)
 
   scenario_required = True
+  scenario_default = None
+
+  parser = argparse.ArgumentParser()
 
   if(len(ctx['config']['docking_scenarios_internal']) == 1):
     scenario_required = False
     scenario_default = list(ctx['config']['docking_scenarios_internal'].keys())[0]
+    parser.add_argument('--scenario-name', action='store', type=str, required=scenario_required, default=scenario_default)
+  else:
+    parser.add_argument('--scenario-name', action='store', type=str, required=True)
 
-  parser = argparse.ArgumentParser()
 
-  parser.add_argument('--scenario-name', action='store', type=str, required=scenario_required, default=scenario_default)
+
   parser.add_argument('--top', action='store', type=int, required=False)
   args = parser.parse_args()
 
@@ -106,7 +111,8 @@ def main():
     print(f"Scenario '{scenario}'' is not defined as part of this job")
     exit(1)
 
-  table_name = ctx['config']['job_name'].replace("-","_")
+  table_name = f"{ctx['config']['job_name']}__{scenario}".replace("-","_")
+
   athena_location = ctx['config']['athena_s3_location']
   database_name = f"{ctx['config']['aws_batch_prefix']}_vfvs"
   job_location = f"{ctx['config']['object_store_job_prefix_full']}/{scenario}/parquet"
@@ -221,9 +227,6 @@ def main():
     top_string = ""
 
   select_statement = f"SELECT * from {table_name} ORDER BY score_min ASC {top_string};"
-  print(f"|{select_statement}|")
-
-
 
   select_response = client.start_query_execution(
       QueryString=select_statement,
