@@ -1070,6 +1070,7 @@ def docking_finish_vina(item, ret):
     if(match):
         matches = match.groupdict()
         item['score'] = float(matches['value'])
+        item['status'] = "success"
     else:
         item['log']['reason'] = f"Could not find score"
         logging.error(item['log']['reason'])
@@ -1099,6 +1100,7 @@ def docking_finish_smina(item, ret):
         if(match):
             matches = match.groupdict()
             item['score'] = float(matches['value'])
+            item['status'] = "success"
             found = 1
             break
     if(found == 0):

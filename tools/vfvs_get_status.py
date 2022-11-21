@@ -187,10 +187,14 @@ def process(config):
                     workunit_has_changed = 1
 
                 if('status_summary' in workunit):
+
                     for status_val in job['arrayProperties']['statusSummary']:
-                        if(workunit['status_summary'][status_val] != job['arrayProperties']['statusSummary'][status_val]):
-                                workunit_has_changed = 1
-                                break
+                        if status_val not in workunit['status_summary']:
+                            workunit['status_summary'][status_val] = job['arrayProperties']['statusSummary'][status_val]
+                            workunit_has_changed = 1
+                        elif(workunit['status_summary'][status_val] != job['arrayProperties']['statusSummary'][status_val]):
+                            workunit['status_summary'][status_val] = job['arrayProperties']['statusSummary'][status_val]
+                            workunit_has_changed = 1
                 else:
                     workunit['status_summary'] = job['arrayProperties']['statusSummary'].copy()
                     workunit_has_changed = 1
